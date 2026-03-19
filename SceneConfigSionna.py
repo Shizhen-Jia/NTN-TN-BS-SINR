@@ -131,6 +131,9 @@ class SceneConfigSionna:
         self.point_type = None
         self.paths_tn = None
         self.paths_ntn = None
+        self.paths_tn_to_bs = None
+        self.paths_ntn_to_bs = None
+        self.paths_ntn_to_tn = None
 
         # Position arrays
         self.tx_pos = None
@@ -143,6 +146,12 @@ class SceneConfigSionna:
         self.tau_tn = None
         self.a_ntn = None
         self.tau_ntn = None
+        self.a_tn_to_bs = None
+        self.tau_tn_to_bs = None
+        self.a_ntn_to_bs = None
+        self.tau_ntn_to_bs = None
+        self.a_ntn_to_tn = None
+        self.tau_ntn_to_tn = None
         self.ntn_rx = None
         
         self.toff = None
@@ -224,6 +233,167 @@ class SceneConfigSionna:
             plt.title("Building/Outdoor Map")
         plt.show()
 
+    def _clear_radio_nodes(self):
+        for rx_name in list(self.scene.receivers):
+            self.scene.remove(rx_name)
+        for tx_name in list(self.scene.transmitters):
+            self.scene.remove(tx_name)
+
+    def _make_planar_array(self, num_rows, num_cols, pattern, polarization="V"):
+        return PlanarArray(
+            num_rows=int(num_rows),
+            num_cols=int(num_cols),
+            vertical_spacing=0.5,
+            horizontal_spacing=0.5,
+            polarization=polarization,
+            pattern=pattern,
+        )
+
+    def _solve_paths(self, p_solver, *, max_depth):
+        return p_solver(
+            scene=self.scene,
+            max_depth=max_depth,
+            los=True,
+            specular_reflection=True,
+            diffuse_reflection=False,
+            refraction=True,
+            synthetic_array=True,
+        )
+
+    def _make_receiver(self, *, name, position, color=None, orientation=None):
+        kwargs = {"name": name, "position": position}
+        if color is not None:
+            kwargs["color"] = color
+        if orientation is not None:
+            try:
+                return Receiver(orientation=orientation, **kwargs)
+            except TypeError:
+                rx = Receiver(**kwargs)
+                try:
+                    rx.orientation = orientation
+                except Exception:
+                    pass
+                return rx
+        return Receiver(**kwargs)
+
+    def _add_bs_sector_receivers(self, name_prefix="bs-rx"):
+        if self.tx_pos is None or self.tx_pos.shape[0] == 0:
+            raise ValueError("tx_pos is empty; run compute_positions first.")
+        if self.nsect is None:
+            raise ValueError("nsect is not set; run compute_paths first.")
+
+        if self.tx_orientation_rad is None:
+            sector_yaw = np.mod(
+                float(self.tx_sector_yaw_offset_rad) + 2.0 * np.pi * np.arange(self.nsect) / self.nsect,
+                2.0 * np.pi,
+            )
+            tx_orientation = []
+            for _ in range(self.nbs):
+                for s in range(self.nsect):
+                    tx_orientation.append(
+                        [
+                            float(sector_yaw[s]),
+                            float(self.tx_sector_pitch_rad),
+                            float(self.tx_sector_roll_rad),
+                        ]
+                    )
+            orientations = np.asarray(tx_orientation, dtype=float)
+        else:
+            orientations = np.asarray(self.tx_orientation_rad, dtype=float)
+
+        rx_name_list = []
+        flat_idx = 0
+        for bs_idx in range(self.tx_pos.shape[0]):
+            for sec_idx in range(self.nsect):
+                rx = self._make_receiver(
+                    name=f"{name_prefix}-{bs_idx}-{sec_idx}",
+                    position=self.tx_pos[bs_idx],
+                    color=[1.0, 0.0, 0.0],
+                    orientation=orientations[flat_idx].tolist(),
+                )
+                self.scene.add(rx)
+                rx_name_list.append(rx.name)
+                flat_idx += 1
+        return rx_name_list
+
+    def _add_tn_transmitters(self, *, power_dbm, name_prefix="tn-tx"):
+        if self.tn_pos is None:
+            raise ValueError("tn_pos is empty; run compute_positions first.")
+        if self.tx_pos is None or self.tx_pos.shape[0] == 0:
+            raise ValueError("tx_pos is empty; run compute_positions first.")
+
+        if self.tn_bs_index is None:
+            diffs = self.tn_pos[:, None, :2] - self.tx_pos[None, :, :2]
+            d2 = np.sum(diffs**2, axis=2)
+            tn_bs_index = np.argmin(d2, axis=1)
+        else:
+            tn_bs_index = np.asarray(self.tn_bs_index, dtype=int)
+
+        tx_name_list = []
+        for i, pos in enumerate(self.tn_pos):
+            tx = Transmitter(
+                name=f"{name_prefix}-{i}",
+                position=pos,
+                power_dbm=float(power_dbm),
+            )
+            self.scene.add(tx)
+            if hasattr(tx, "look_at"):
+                try:
+                    tx.look_at(self.tx_pos[int(tn_bs_index[i])])
+                except Exception:
+                    pass
+            tx_name_list.append(tx.name)
+        return tx_name_list
+
+    def _add_tn_receivers(self, name_prefix="tn-rx"):
+        if self.tn_pos is None:
+            raise ValueError("tn_pos is empty; run compute_positions first.")
+        if self.tx_pos is None or self.tx_pos.shape[0] == 0:
+            raise ValueError("tx_pos is empty; run compute_positions first.")
+
+        if self.tn_bs_index is None:
+            diffs = self.tn_pos[:, None, :2] - self.tx_pos[None, :, :2]
+            d2 = np.sum(diffs**2, axis=2)
+            tn_bs_index = np.argmin(d2, axis=1)
+        else:
+            tn_bs_index = np.asarray(self.tn_bs_index, dtype=int)
+
+        rx_name_list = []
+        for i, pos in enumerate(self.tn_pos):
+            rx = self._make_receiver(
+                name=f"{name_prefix}-{i}",
+                position=pos,
+                color=[0.0, 1.0, 0.0],
+            )
+            self.scene.add(rx)
+            if hasattr(rx, "look_at"):
+                try:
+                    rx.look_at(self.tx_pos[int(tn_bs_index[i])])
+                except Exception:
+                    pass
+            rx_name_list.append(rx.name)
+        return rx_name_list
+
+    def _add_ntn_transmitters(self, *, power_dbm, name_prefix="ntn-tx"):
+        if self.rx_ntn_pos is None:
+            raise ValueError("rx_ntn_pos is empty; run compute_positions first.")
+
+        tx_name_list = []
+        for i, pos in enumerate(self.rx_ntn_pos):
+            tx = Transmitter(
+                name=f"{name_prefix}-{i}",
+                position=pos,
+                power_dbm=float(power_dbm),
+            )
+            self.scene.add(tx)
+            if hasattr(tx, "look_at"):
+                try:
+                    tx.look_at([0.0, 0.0, 20000.0])
+                except Exception:
+                    pass
+            tx_name_list.append(tx.name)
+        return tx_name_list
+
     def _snap_to_grid(self, x, y, height_roof=None, height_ground=None):
         x = np.asarray(x)
         y = np.asarray(y)
@@ -283,6 +453,11 @@ class SceneConfigSionna:
         4) Filter TN receivers by distance constraints
         5) Compute random satellite direction & project
         """
+
+        if isinstance(tn_building_ratio, str):
+            tn_building_ratio = tn_building_ratio.strip().lower()
+        if isinstance(bs_layout, str):
+            bs_layout = bs_layout.strip().lower()
 
         # 1) Create/reuse coverage map
         self.ntn_rx = ntn_rx
@@ -705,3 +880,105 @@ class SceneConfigSionna:
             # Compute paths for TN
 
             self.a_ntn, self.tau_ntn = self.paths_ntn.cir(normalize_delays=False, out_type="numpy")
+
+    def compute_sinr_channels(
+        self,
+        tx_rows=8,
+        tx_cols=8,
+        tn_rows=1,
+        tn_cols=1,
+        max_depth=3,
+        bandwidth=100e6,
+        tn_tx_power_dbm=30,
+        ntn_tx_power_dbm=30,
+    ):
+        """
+        Compute the extra channels required by the two-mode SINR experiment.
+
+        The current BS/TN/NTN positions and BS sector orientations are reused.
+        This method adds three additional link tensors:
+            1) TN  -> BS sectors
+            2) NTN -> BS sectors
+            3) NTN -> TN users
+        """
+        if self.tx_pos is None or self.tx_pos.shape[0] == 0:
+            raise ValueError("tx_pos is empty; run compute_positions first.")
+        if self.tn_pos is None:
+            raise ValueError("tn_pos is empty; run compute_positions first.")
+        if self.nsect is None:
+            raise ValueError("nsect is not set; run compute_paths first.")
+
+        self.scene.frequency = self.fc
+        self.scene.bandwidth = bandwidth
+        self.scene.synthetic_array = True
+
+        p_solver = PathSolver()
+
+        # TN -> BS sectors (uplink desired link for Mode 2)
+        self._clear_radio_nodes()
+        self.scene.tx_array = self._make_planar_array(
+            num_rows=tn_rows,
+            num_cols=tn_cols,
+            pattern="dipole",
+        )
+        self.scene.rx_array = self._make_planar_array(
+            num_rows=tx_rows,
+            num_cols=tx_cols,
+            pattern="tr38901",
+        )
+        self._add_tn_transmitters(power_dbm=tn_tx_power_dbm)
+        self._add_bs_sector_receivers(name_prefix="bs-rx-ul")
+        self.paths_tn_to_bs = self._solve_paths(p_solver, max_depth=max_depth)
+        self.a_tn_to_bs, self.tau_tn_to_bs = self.paths_tn_to_bs.cir(
+            normalize_delays=False,
+            out_type="numpy",
+        )
+
+        if self.ntn_rx is None or int(self.ntn_rx) <= 0 or self.rx_ntn_pos is None:
+            self.paths_ntn_to_bs = None
+            self.paths_ntn_to_tn = None
+            self.a_ntn_to_bs = None
+            self.tau_ntn_to_bs = None
+            self.a_ntn_to_tn = None
+            self.tau_ntn_to_tn = None
+            return
+
+        # NTN -> BS sectors (uplink interference for Mode 2)
+        self._clear_radio_nodes()
+        self.scene.tx_array = self._make_planar_array(
+            num_rows=1,
+            num_cols=1,
+            pattern="vsat",
+        )
+        self.scene.rx_array = self._make_planar_array(
+            num_rows=tx_rows,
+            num_cols=tx_cols,
+            pattern="tr38901",
+        )
+        self._add_ntn_transmitters(power_dbm=ntn_tx_power_dbm)
+        self._add_bs_sector_receivers(name_prefix="bs-rx-int")
+        self.paths_ntn_to_bs = self._solve_paths(p_solver, max_depth=max_depth)
+        self.a_ntn_to_bs, self.tau_ntn_to_bs = self.paths_ntn_to_bs.cir(
+            normalize_delays=False,
+            out_type="numpy",
+        )
+
+        # NTN -> TN users (uplink interference for Mode 1)
+        self._clear_radio_nodes()
+        self.scene.tx_array = self._make_planar_array(
+            num_rows=1,
+            num_cols=1,
+            pattern="vsat",
+        )
+        self.scene.rx_array = self._make_planar_array(
+            num_rows=tn_rows,
+            num_cols=tn_cols,
+            pattern="dipole",
+        )
+        self._add_ntn_transmitters(power_dbm=ntn_tx_power_dbm)
+        self._add_tn_receivers(name_prefix="tn-rx-int")
+        self.paths_ntn_to_tn = self._solve_paths(p_solver, max_depth=max_depth)
+        self.a_ntn_to_tn, self.tau_ntn_to_tn = self.paths_ntn_to_tn.cir(
+            normalize_delays=False,
+            out_type="numpy",
+        )
