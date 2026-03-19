@@ -65,7 +65,7 @@ For the current two-mode SINR workflow, the main Python APIs are:
 - `SceneConfigSionna.compute_paths(...)`
 - `SceneConfigSionna.compute_sinr_channels(...)`
 - `sinr_cdf_utils.run_two_mode_sinr_cdf_experiment(...)`
-- `sinr_cdf_utils.run_and_plot_two_mode_sinr_cdf_experiment(...)`
+- `sinr_cdf_utils.save_two_mode_sinr_metrics(...)`
 
 Key functions:
 
@@ -73,17 +73,16 @@ Key functions:
 - `compute_two_mode_sinr_samples`
 - `run_two_mode_sinr_cdf_experiment`
 - `save_two_mode_sinr_metrics`
-- `plot_two_mode_sinr_cdfs`
 
 ## Recommended Usage
 
-The simplest recommended flow is:
+The recommended flow is:
 
 ```python
 import sinr_cdf_utils as ncu
 from SceneConfigSionna import SceneConfigSionna
 
-results = ncu.run_and_plot_two_mode_sinr_cdf_experiment(
+results = ncu.run_two_mode_sinr_cdf_experiment(
     SceneConfig,
     num_macro_sims=N,
     ntn_drop_counts=[100, 200, 300],
@@ -96,12 +95,18 @@ results = ncu.run_and_plot_two_mode_sinr_cdf_experiment(
     tn_noise_power=tn_noise_power,
     bs_noise_power=bs_noise_power,
 )
+
+metrics_path = ncu.save_two_mode_sinr_metrics(
+    results,
+    result_dir="result",
+    output_name="two_mode_sinr_metrics.npz",
+)
 ```
+
+Plotting is now kept in `SINR_CDF.ipynb`, so you can edit titles, styles, and save paths directly in the notebook.
 
 This produces:
 
-- one SINR CDF figure for `Mode 1`
-- one SINR CDF figure for `Mode 2`
 - three SINR curves in each figure for `NTN = 100, 200, 300`
 - saved metrics in `result/`
 

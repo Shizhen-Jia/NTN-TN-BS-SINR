@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import inspect
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Any, Dict, Iterable, List
 
 import numpy as np
 
@@ -717,7 +718,23 @@ def _build_sinr_channel_kwargs(compute_paths_kwargs: Dict[str, Any]) -> Dict[str
         "bandwidth": float(compute_paths_kwargs.get("bandwidth", 100e6)),
         "tn_tx_power_dbm": float(compute_paths_kwargs.get("tn_tx_power_dbm", tx_power_dbm_default)),
         "ntn_tx_power_dbm": float(compute_paths_kwargs.get("ntn_tx_power_dbm", tx_power_dbm_default)),
+        "ntn_tx_batch_size": int(compute_paths_kwargs.get("ntn_tx_batch_size", 32)),
     }
+
+
+def _filter_callable_kwargs(func: Any, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    """Keep only keyword arguments accepted by ``func``.
+
+    This lets the notebook use one high-level configuration dict while the
+    runner safely forwards only the parameters each scene method supports.
+    """
+    signature = inspect.signature(func)
+    accepted = {
+        name
+        for name, param in signature.parameters.items()
+        if param.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+    }
+    return {key: value for key, value in kwargs.items() if key in accepted}
 
 
 def run_two_mode_sinr_cdf_experiment(
@@ -750,7 +767,13 @@ def run_two_mode_sinr_cdf_experiment(
     if not ntn_counts:
         raise ValueError("ntn_drop_counts must contain at least one NTN count.")
 
-    sinr_channel_kwargs = _build_sinr_channel_kwargs(compute_paths_kwargs)
+    path_kwargs = _filter_callable_kwargs(scene_config.compute_paths, compute_paths_kwargs)
+    if "compute_ntn_paths" in inspect.signature(scene_config.compute_paths).parameters:
+        path_kwargs.setdefault("compute_ntn_paths", False)
+    sinr_channel_kwargs = _filter_callable_kwargs(
+        scene_config.compute_sinr_channels,
+        _build_sinr_channel_kwargs(compute_paths_kwargs),
+    )
     mode1_sinr_all: Dict[int, List[float]] = {count: [] for count in ntn_counts}
     mode2_sinr_all: Dict[int, List[float]] = {count: [] for count in ntn_counts}
     macro_stats: Dict[int, List[Dict[str, Any]]] = {count: [] for count in ntn_counts}
@@ -786,7 +809,12 @@ def run_two_mode_sinr_cdf_experiment(
                     "The requested experiment assumes fixed BS positions."
                 )
 
-            scene_config.compute_paths(**compute_paths_kwargs)
+            scene_config.compute_paths(**path_kwargs)
+            for attr in ("paths_tn", "paths_ntn"):
+                if hasattr(scene_config, attr):
+                    setattr(scene_config, attr, None)
+            if hasattr(scene_config, "_best_effort_rt_memory_cleanup"):
+                scene_config._best_effort_rt_memory_cleanup()
             scene_config.compute_sinr_channels(**sinr_channel_kwargs)
 
             h_bs_to_tn = collapse_cir_to_narrowband(scene_config.a_tn)
@@ -801,6 +829,25 @@ def run_two_mode_sinr_cdf_experiment(
                 if scene_config.a_ntn_to_bs is None
                 else collapse_cir_to_narrowband(scene_config.a_ntn_to_bs)
             )
+            for attr in (
+                "a_tn",
+                "tau_tn",
+                "a_ntn",
+                "tau_ntn",
+                "a_tn_to_bs",
+                "tau_tn_to_bs",
+                "a_ntn_to_tn",
+                "tau_ntn_to_tn",
+                "a_ntn_to_bs",
+                "tau_ntn_to_bs",
+                "paths_tn_to_bs",
+                "paths_ntn_to_tn",
+                "paths_ntn_to_bs",
+            ):
+                if hasattr(scene_config, attr):
+                    setattr(scene_config, attr, None)
+            if hasattr(scene_config, "_best_effort_rt_memory_cleanup"):
+                scene_config._best_effort_rt_memory_cleanup()
 
             pairing = pair_tn_to_strongest_tx(
                 h_bs_to_tn,
@@ -893,147 +940,3 @@ def save_two_mode_sinr_metrics(
 
     np.savez(save_path, **save_dict)
     return save_path
-
-
-def _cdf_curve(values: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    vals = np.asarray(values, dtype=np.float64)
-    vals = vals[np.isfinite(vals)]
-    if vals.size == 0:
-        return np.empty((0,), dtype=np.float64), np.empty((0,), dtype=np.float64)
-    vals_sorted = np.sort(vals)
-    cdf = np.arange(1, vals_sorted.size + 1, dtype=np.float64) / float(vals_sorted.size)
-    return vals_sorted, cdf
-
-
-def plot_two_mode_sinr_cdfs(
-    experiment_out: Dict[str, Any],
-    *,
-    result_dir: str | Path = "result",
-    output_prefix: str = "two_mode_sinr_cdf",
-    figure_size: Tuple[float, float] = (3.5, 2.6),
-) -> Dict[str, Dict[str, Path]]:
-    """Plot one CDF figure per mode with one curve per NTN drop count."""
-    import matplotlib.pyplot as plt
-
-    plt.rcParams.update(
-        {
-            "font.family": "serif",
-            "font.serif": ["Times New Roman", "Times", "DejaVu Serif"],
-            "font.size": 8,
-            "axes.labelsize": 8,
-            "axes.titlesize": 8,
-            "legend.fontsize": 7,
-            "xtick.labelsize": 7,
-            "ytick.labelsize": 7,
-            "lines.linewidth": 1.4,
-        }
-    )
-
-    result_path = Path(result_dir)
-    result_path.mkdir(parents=True, exist_ok=True)
-    colors = ["#1f77b4", "#d62728", "#2ca02c", "#ff7f0e", "#8c564b", "#17becf"]
-    styles = ["-", "--", "-.", ":", (0, (4, 1, 1, 1)), (0, (6, 2))]
-
-    mode_specs = [
-        (
-            "mode1_sinr_db",
-            "mode1",
-            "Mode 1 SINR CDF",
-            "Signal: BS, Interference: NTN",
-        ),
-        (
-            "mode2_sinr_db",
-            "mode2",
-            "Mode 2 SINR CDF",
-            "Signal: TN, Interference: NTN",
-        ),
-    ]
-
-    out_paths: Dict[str, Dict[str, Path]] = {}
-    for key, tag, title, subtitle in mode_specs:
-        fig, ax = plt.subplots(figsize=figure_size)
-        data = experiment_out.get(key, {})
-        plotted = False
-        for idx, ntn_count in enumerate(sorted(int(v) for v in data.keys())):
-            x, y = _cdf_curve(data[int(ntn_count)])
-            if x.size == 0:
-                continue
-            ax.plot(
-                x,
-                y,
-                color=colors[idx % len(colors)],
-                linestyle=styles[idx % len(styles)],
-                label=f"NTN={int(ntn_count)}",
-            )
-            plotted = True
-
-        ax.set_xlabel("SINR (dB)")
-        ax.set_ylabel("CDF")
-        ax.set_title(f"{title}\n{subtitle}")
-        ax.set_ylim(0.0, 1.0)
-        ax.grid(True, linestyle=":", linewidth=0.6, alpha=0.8)
-        if plotted:
-            ax.legend(loc="lower right", frameon=True)
-        fig.tight_layout(pad=0.2)
-
-        png_path = result_path / f"{output_prefix}_{tag}.png"
-        pdf_path = result_path / f"{output_prefix}_{tag}.pdf"
-        fig.savefig(png_path, dpi=400, bbox_inches="tight")
-        fig.savefig(pdf_path, bbox_inches="tight")
-        plt.close(fig)
-
-        out_paths[tag] = {"png": png_path, "pdf": pdf_path}
-
-    return out_paths
-
-
-def run_and_plot_two_mode_sinr_cdf_experiment(
-    scene_config: Any,
-    *,
-    num_macro_sims: int,
-    ntn_drop_counts: Iterable[int],
-    compute_positions_kwargs: Dict[str, Any],
-    compute_paths_kwargs: Dict[str, Any],
-    h_tn_th: float,
-    bs_tx_power: float,
-    tn_tx_power: float,
-    ntn_tx_power: float,
-    tn_noise_power: float,
-    bs_noise_power: float,
-    result_dir: str | Path = "result",
-    metrics_output_name: str = "two_mode_sinr_metrics.npz",
-    figure_output_prefix: str = "two_mode_sinr_cdf",
-    eps: float = 1e-12,
-    plot_first_sim_only: bool = True,
-    show_progress: bool = True,
-) -> Dict[str, Any]:
-    """Convenience wrapper to run, save, and plot the two-mode SINR experiment."""
-    experiment_out = run_two_mode_sinr_cdf_experiment(
-        scene_config,
-        num_macro_sims=num_macro_sims,
-        ntn_drop_counts=ntn_drop_counts,
-        compute_positions_kwargs=compute_positions_kwargs,
-        compute_paths_kwargs=compute_paths_kwargs,
-        h_tn_th=h_tn_th,
-        bs_tx_power=bs_tx_power,
-        tn_tx_power=tn_tx_power,
-        ntn_tx_power=ntn_tx_power,
-        tn_noise_power=tn_noise_power,
-        bs_noise_power=bs_noise_power,
-        eps=eps,
-        plot_first_sim_only=plot_first_sim_only,
-        show_progress=show_progress,
-    )
-    metrics_path = save_two_mode_sinr_metrics(
-        experiment_out,
-        result_dir=result_dir,
-        output_name=metrics_output_name,
-    )
-    figure_paths = plot_two_mode_sinr_cdfs(
-        experiment_out,
-        result_dir=result_dir,
-        output_prefix=figure_output_prefix,
-    )
-    experiment_out["metrics_path"] = metrics_path
-    experiment_out["figure_paths"] = figure_paths
-    return experiment_out

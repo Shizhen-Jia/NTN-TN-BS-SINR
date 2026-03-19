@@ -1,5 +1,6 @@
 import os
 os.environ.pop("TF_USE_LEGACY_KERAS", None)   # 或 os.environ["TF_USE_LEGACY_KERAS"]="0"
+import gc
 
 if os.getenv("CUDA_VISIBLE_DEVICES") is None:
     gpu_num = 0 # Use "" to use the CPU
@@ -260,6 +261,72 @@ class SceneConfigSionna:
             synthetic_array=True,
         )
 
+    def _best_effort_rt_memory_cleanup(self):
+        gc.collect()
+        try:
+            import drjit as dr
+
+            if hasattr(dr, "sync_thread"):
+                dr.sync_thread()
+            if hasattr(dr, "flush_malloc_cache"):
+                dr.flush_malloc_cache()
+        except Exception:
+            pass
+
+    def _solve_cir_numpy(self, p_solver, *, max_depth):
+        paths = self._solve_paths(p_solver, max_depth=max_depth)
+        try:
+            return paths.cir(normalize_delays=False, out_type="numpy")
+        finally:
+            del paths
+            self._best_effort_rt_memory_cleanup()
+
+    def _solve_cir_for_tx_batches(
+        self,
+        *,
+        p_solver,
+        max_depth,
+        tx_indices,
+        tx_batch_size,
+        add_tx_batch_fn,
+        add_rx_fn,
+    ):
+        tx_indices = np.asarray(tx_indices, dtype=int)
+        if tx_indices.size == 0:
+            return None, None
+
+        if tx_batch_size is None:
+            tx_batch_size = int(tx_indices.size)
+        else:
+            tx_batch_size = max(1, int(tx_batch_size))
+
+        if tx_batch_size >= int(tx_indices.size):
+            self._clear_radio_nodes()
+            add_tx_batch_fn(tx_indices)
+            add_rx_fn()
+            try:
+                return self._solve_cir_numpy(p_solver, max_depth=max_depth)
+            finally:
+                self._clear_radio_nodes()
+                self._best_effort_rt_memory_cleanup()
+
+        a_chunks = []
+        for start in range(0, int(tx_indices.size), tx_batch_size):
+            batch = tx_indices[start : start + tx_batch_size]
+            self._clear_radio_nodes()
+            add_tx_batch_fn(batch)
+            add_rx_fn()
+            try:
+                a_chunk, _tau_chunk = self._solve_cir_numpy(p_solver, max_depth=max_depth)
+            finally:
+                self._clear_radio_nodes()
+                self._best_effort_rt_memory_cleanup()
+            a_chunks.append(np.asarray(a_chunk))
+
+        if not a_chunks:
+            return None, None
+        return np.concatenate(a_chunks, axis=2), None
+
     def _make_receiver(self, *, name, position, color=None, orientation=None):
         kwargs = {"name": name, "position": position}
         if color is not None:
@@ -316,7 +383,7 @@ class SceneConfigSionna:
                 flat_idx += 1
         return rx_name_list
 
-    def _add_tn_transmitters(self, *, power_dbm, name_prefix="tn-tx"):
+    def _add_tn_transmitters(self, *, power_dbm, name_prefix="tn-tx", indices=None):
         if self.tn_pos is None:
             raise ValueError("tn_pos is empty; run compute_positions first.")
         if self.tx_pos is None or self.tx_pos.shape[0] == 0:
@@ -329,8 +396,14 @@ class SceneConfigSionna:
         else:
             tn_bs_index = np.asarray(self.tn_bs_index, dtype=int)
 
+        if indices is None:
+            indices = np.arange(self.tn_pos.shape[0], dtype=int)
+        else:
+            indices = np.asarray(indices, dtype=int)
+
         tx_name_list = []
-        for i, pos in enumerate(self.tn_pos):
+        for i in indices:
+            pos = self.tn_pos[int(i)]
             tx = Transmitter(
                 name=f"{name_prefix}-{i}",
                 position=pos,
@@ -345,7 +418,7 @@ class SceneConfigSionna:
             tx_name_list.append(tx.name)
         return tx_name_list
 
-    def _add_tn_receivers(self, name_prefix="tn-rx"):
+    def _add_tn_receivers(self, name_prefix="tn-rx", indices=None):
         if self.tn_pos is None:
             raise ValueError("tn_pos is empty; run compute_positions first.")
         if self.tx_pos is None or self.tx_pos.shape[0] == 0:
@@ -358,8 +431,14 @@ class SceneConfigSionna:
         else:
             tn_bs_index = np.asarray(self.tn_bs_index, dtype=int)
 
+        if indices is None:
+            indices = np.arange(self.tn_pos.shape[0], dtype=int)
+        else:
+            indices = np.asarray(indices, dtype=int)
+
         rx_name_list = []
-        for i, pos in enumerate(self.tn_pos):
+        for i in indices:
+            pos = self.tn_pos[int(i)]
             rx = self._make_receiver(
                 name=f"{name_prefix}-{i}",
                 position=pos,
@@ -374,12 +453,18 @@ class SceneConfigSionna:
             rx_name_list.append(rx.name)
         return rx_name_list
 
-    def _add_ntn_transmitters(self, *, power_dbm, name_prefix="ntn-tx"):
+    def _add_ntn_transmitters(self, *, power_dbm, name_prefix="ntn-tx", indices=None):
         if self.rx_ntn_pos is None:
             raise ValueError("rx_ntn_pos is empty; run compute_positions first.")
 
+        if indices is None:
+            indices = np.arange(self.rx_ntn_pos.shape[0], dtype=int)
+        else:
+            indices = np.asarray(indices, dtype=int)
+
         tx_name_list = []
-        for i, pos in enumerate(self.rx_ntn_pos):
+        for i in indices:
+            pos = self.rx_ntn_pos[int(i)]
             tx = Transmitter(
                 name=f"{name_prefix}-{i}",
                 position=pos,
@@ -708,7 +793,7 @@ class SceneConfigSionna:
         
 
     def compute_paths(self, nsect, fc, tx_rows = 8, tx_cols = 8, tn_rx_rows = 1, tn_rx_cols = 1, max_depth=3,
-                      bandwidth=100e6, tx_power_dbm=30,
+                      bandwidth=100e6, tx_power_dbm=30, compute_ntn_paths=True,
                       sector_yaw_offset_rad=None,
                       sector_pitch_rad=None,
                       sector_roll_rad=None):
@@ -844,7 +929,7 @@ class SceneConfigSionna:
         # [num_rx, num_rx_ant, num_tx, num_tx_ant, num_paths, num_time_steps]
         self.a_tn, self.tau_tn = self.paths_tn.cir(normalize_delays=False, out_type="numpy")
 
-        if self.ntn_rx > 0:
+        if self.ntn_rx > 0 and bool(compute_ntn_paths):
             for rx_name in list(self.scene.receivers):
                 self.scene.remove(rx_name)
 
@@ -880,6 +965,10 @@ class SceneConfigSionna:
             # Compute paths for TN
 
             self.a_ntn, self.tau_ntn = self.paths_ntn.cir(normalize_delays=False, out_type="numpy")
+        else:
+            self.paths_ntn = None
+            self.a_ntn = None
+            self.tau_ntn = None
 
     def compute_sinr_channels(
         self,
@@ -891,6 +980,7 @@ class SceneConfigSionna:
         bandwidth=100e6,
         tn_tx_power_dbm=30,
         ntn_tx_power_dbm=30,
+        ntn_tx_batch_size=32,
     ):
         """
         Compute the extra channels required by the two-mode SINR experiment.
@@ -928,11 +1018,13 @@ class SceneConfigSionna:
         )
         self._add_tn_transmitters(power_dbm=tn_tx_power_dbm)
         self._add_bs_sector_receivers(name_prefix="bs-rx-ul")
-        self.paths_tn_to_bs = self._solve_paths(p_solver, max_depth=max_depth)
-        self.a_tn_to_bs, self.tau_tn_to_bs = self.paths_tn_to_bs.cir(
-            normalize_delays=False,
-            out_type="numpy",
+        self.a_tn_to_bs, self.tau_tn_to_bs = self._solve_cir_numpy(
+            p_solver,
+            max_depth=max_depth,
         )
+        self.paths_tn_to_bs = None
+        self._clear_radio_nodes()
+        self._best_effort_rt_memory_cleanup()
 
         if self.ntn_rx is None or int(self.ntn_rx) <= 0 or self.rx_ntn_pos is None:
             self.paths_ntn_to_bs = None
@@ -955,16 +1047,20 @@ class SceneConfigSionna:
             num_cols=tx_cols,
             pattern="tr38901",
         )
-        self._add_ntn_transmitters(power_dbm=ntn_tx_power_dbm)
-        self._add_bs_sector_receivers(name_prefix="bs-rx-int")
-        self.paths_ntn_to_bs = self._solve_paths(p_solver, max_depth=max_depth)
-        self.a_ntn_to_bs, self.tau_ntn_to_bs = self.paths_ntn_to_bs.cir(
-            normalize_delays=False,
-            out_type="numpy",
+        self.a_ntn_to_bs, self.tau_ntn_to_bs = self._solve_cir_for_tx_batches(
+            p_solver=p_solver,
+            max_depth=max_depth,
+            tx_indices=np.arange(self.rx_ntn_pos.shape[0], dtype=int),
+            tx_batch_size=ntn_tx_batch_size,
+            add_tx_batch_fn=lambda batch: self._add_ntn_transmitters(
+                power_dbm=ntn_tx_power_dbm,
+                indices=batch,
+            ),
+            add_rx_fn=lambda: self._add_bs_sector_receivers(name_prefix="bs-rx-int"),
         )
+        self.paths_ntn_to_bs = None
 
         # NTN -> TN users (uplink interference for Mode 1)
-        self._clear_radio_nodes()
         self.scene.tx_array = self._make_planar_array(
             num_rows=1,
             num_cols=1,
@@ -975,10 +1071,17 @@ class SceneConfigSionna:
             num_cols=tn_cols,
             pattern="dipole",
         )
-        self._add_ntn_transmitters(power_dbm=ntn_tx_power_dbm)
-        self._add_tn_receivers(name_prefix="tn-rx-int")
-        self.paths_ntn_to_tn = self._solve_paths(p_solver, max_depth=max_depth)
-        self.a_ntn_to_tn, self.tau_ntn_to_tn = self.paths_ntn_to_tn.cir(
-            normalize_delays=False,
-            out_type="numpy",
+        self.a_ntn_to_tn, self.tau_ntn_to_tn = self._solve_cir_for_tx_batches(
+            p_solver=p_solver,
+            max_depth=max_depth,
+            tx_indices=np.arange(self.rx_ntn_pos.shape[0], dtype=int),
+            tx_batch_size=ntn_tx_batch_size,
+            add_tx_batch_fn=lambda batch: self._add_ntn_transmitters(
+                power_dbm=ntn_tx_power_dbm,
+                indices=batch,
+            ),
+            add_rx_fn=lambda: self._add_tn_receivers(name_prefix="tn-rx-int"),
         )
+        self.paths_ntn_to_tn = None
+        self._clear_radio_nodes()
+        self._best_effort_rt_memory_cleanup()
