@@ -9,13 +9,6 @@ import numpy as np
 from BeamformingCalc import svd_bf
 
 
-def _as_complex_array(x: np.ndarray) -> np.ndarray:
-    """Convert input to a complex ndarray without modifying the original."""
-    arr = np.asarray(x)
-    if np.iscomplexobj(arr):
-        return arr.astype(np.complex128, copy=False)
-    return arr.astype(np.complex128) + 0j
-
 
 def collapse_cir_to_narrowband(cir: np.ndarray) -> np.ndarray:
     """Collapse CIR to narrowband channel tensor with stable axis order.
@@ -25,7 +18,7 @@ def collapse_cir_to_narrowband(cir: np.ndarray) -> np.ndarray:
     The function sums over all trailing axes after tx-ant, returning:
         h_all.shape == (num_rx, num_rx_ant, num_tx, num_tx_ant)
     """
-    h = _as_complex_array(cir)
+    h = np.asarray(cir, dtype=np.complex128)
     if h.ndim < 4:
         raise ValueError(
             "cir must have at least 4 dims: "
