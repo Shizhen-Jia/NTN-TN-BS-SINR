@@ -18,17 +18,14 @@ if gpus:
 tf.get_logger().setLevel('ERROR')
 # from antenna_vsat import v60g_tx_pattern_x_axis
 from satellite_projection import satellite_projection
-import sionna
-import sionnautils
 from sionnautils.miutils import CoverageMapPlanner 
-from sionna.rt import Scene,load_scene, PlanarArray, Transmitter, Receiver, Camera,\
-                      PathSolver, RadioMapSolver, subcarrier_frequencies, AntennaPattern
+from sionna.rt import PlanarArray, Transmitter, Receiver, PathSolver
 # from sionna.channel import cir_to_time_channel
 # from sionna.rt.antenna import visualize
 tf.keras.backend.clear_session()
 from scipy.special import jv
 import mitsuba as mi
-from sionna.rt.antenna_pattern import register_antenna_pattern,create_factory,PolarizedAntennaPattern
+from sionna.rt.antenna_pattern import register_antenna_pattern
 
 
 
@@ -81,9 +78,6 @@ def v_vsat_pattern(theta: mi.Float, phi: mi.Float) -> mi.Complex2f:
     field_amplitude_mi = mi.Float(field_amplitude)
     return mi.Complex2f(field_amplitude_mi, mi.Float(0))
 
-from sionna.rt.antenna_pattern import register_antenna_pattern
-
-
 def create_vsat_factory(name: str):
     def f(*, polarization, polarization_model="tr38901_2"):
         from sionna.rt.antenna_pattern import PolarizedAntennaPattern
@@ -130,12 +124,6 @@ class SceneConfigSionna:
         self.bbox = None
         self.extent = None
         self.point_type = None
-        self.paths_tn = None
-        self.paths_ntn = None
-        self.paths_tn_to_bs = None
-        self.paths_ntn_to_bs = None
-        self.paths_ntn_to_tn = None
-
         # Position arrays
         self.tx_pos = None
         self.rx_ntn_pos = None
@@ -143,10 +131,8 @@ class SceneConfigSionna:
         self.ntn_look_pos = None
 
         # Path results
-        self.a_tn = None
-        self.tau_tn = None
-        self.a_ntn = None
-        self.tau_ntn = None
+        self.a_bs_to_tn = None
+        self.tau_bs_to_tn = None
         self.a_tn_to_bs = None
         self.tau_tn_to_bs = None
         self.a_ntn_to_bs = None
@@ -155,8 +141,6 @@ class SceneConfigSionna:
         self.tau_ntn_to_tn = None
         self.ntn_rx = None
         
-        self.toff = None
-        self.h_tf = None
         self.tn_bs_index = None
         self.tn_sector_index = None
         self.tx_bs_index = None
@@ -250,17 +234,6 @@ class SceneConfigSionna:
             pattern=pattern,
         )
 
-    def _solve_paths(self, p_solver, *, max_depth):
-        return p_solver(
-            scene=self.scene,
-            max_depth=max_depth,
-            los=True,
-            specular_reflection=True,
-            diffuse_reflection=False,
-            refraction=True,
-            synthetic_array=True,
-        )
-
     def _best_effort_rt_memory_cleanup(self):
         gc.collect()
         try:
@@ -274,7 +247,15 @@ class SceneConfigSionna:
             pass
 
     def _solve_cir_numpy(self, p_solver, *, max_depth):
-        paths = self._solve_paths(p_solver, max_depth=max_depth)
+        paths = p_solver(
+            scene=self.scene,
+            max_depth=max_depth,
+            los=True,
+            specular_reflection=True,
+            diffuse_reflection=False,
+            refraction=True,
+            synthetic_array=True,
+        )
         try:
             return paths.cir(normalize_delays=False, out_type="numpy")
         finally:
@@ -343,28 +324,123 @@ class SceneConfigSionna:
                 return rx
         return Receiver(**kwargs)
 
+    def _prepare_bs_sector_state(self):
+        if self.tx_pos is None or self.tx_pos.shape[0] == 0:
+            raise ValueError("tx_pos is empty; run compute_positions first.")
+        if self.nsect is None:
+            raise ValueError("nsect is not set; configure sector metadata first.")
+
+        sector_yaw = np.mod(
+            float(self.tx_sector_yaw_offset_rad) + 2.0 * np.pi * np.arange(self.nsect) / self.nsect,
+            2.0 * np.pi,
+        )
+
+        tx_name_list = []
+        tx_bs_index = []
+        tx_sector_index = []
+        tx_orientation = []
+        for bs_idx in range(self.tx_pos.shape[0]):
+            for sec_idx in range(self.nsect):
+                tx_name_list.append(f"tx-{bs_idx}-{sec_idx}")
+                tx_bs_index.append(int(bs_idx))
+                tx_sector_index.append(int(sec_idx))
+                tx_orientation.append(
+                    [
+                        float(sector_yaw[sec_idx]),
+                        float(self.tx_sector_pitch_rad),
+                        float(self.tx_sector_roll_rad),
+                    ]
+                )
+
+        self.tx_name_list = tx_name_list
+        self.tx_bs_index = np.asarray(tx_bs_index, dtype=int)
+        self.tx_sector_index = np.asarray(tx_sector_index, dtype=int)
+        self.tx_orientation_rad = np.asarray(tx_orientation, dtype=float)
+
+        if self.tn_pos is None or self.tn_pos.shape[0] == 0:
+            self.tn_bs_index = np.empty((0,), dtype=int)
+            self.tn_sector_index = np.empty((0,), dtype=int)
+            return
+
+        diffs = self.tn_pos[:, None, :2] - self.tx_pos[None, :, :2]
+        d2 = np.sum(diffs**2, axis=2)
+        self.tn_bs_index = np.argmin(d2, axis=1)
+
+        bs_xy = self.tx_pos[:, :2]
+        tn_xy = self.tn_pos[:, :2]
+        rel = tn_xy - bs_xy[self.tn_bs_index]
+        ang = np.mod(np.arctan2(rel[:, 1], rel[:, 0]), 2 * np.pi)
+        dtheta = np.abs(ang[:, None] - sector_yaw[None, :])
+        dtheta = np.minimum(dtheta, 2 * np.pi - dtheta)
+        self.tn_sector_index = np.argmin(dtheta, axis=1)
+
+    def configure_cir_scene(
+        self,
+        *,
+        nsect,
+        fc=None,
+        bandwidth=100e6,
+        sector_yaw_offset_rad=None,
+        sector_pitch_rad=None,
+        sector_roll_rad=None,
+    ):
+        """Configure the scene-wide metadata used by subsequent CIR solves."""
+        self.nsect = int(nsect)
+        if fc is not None:
+            self.fc = float(fc)
+        if sector_yaw_offset_rad is not None:
+            self.tx_sector_yaw_offset_rad = float(sector_yaw_offset_rad)
+        if sector_pitch_rad is not None:
+            self.tx_sector_pitch_rad = float(sector_pitch_rad)
+        if sector_roll_rad is not None:
+            self.tx_sector_roll_rad = float(sector_roll_rad)
+
+        self.scene.frequency = float(self.fc)
+        self.scene.bandwidth = float(bandwidth)
+        self.scene.synthetic_array = True
+        self._prepare_bs_sector_state()
+
+    def build_standard_arrays(
+        self,
+        *,
+        tx_rows=8,
+        tx_cols=8,
+        tn_rx_rows=1,
+        tn_rx_cols=1,
+        ntn_rows=1,
+        ntn_cols=1,
+    ):
+        """Build the default BS/TN/NTN arrays used by the SINR workflows."""
+        return {
+            "bs": self._make_planar_array(
+                num_rows=tx_rows,
+                num_cols=tx_cols,
+                pattern="tr38901",
+                polarization="V",
+            ),
+            "tn": self._make_planar_array(
+                num_rows=tn_rx_rows,
+                num_cols=tn_rx_cols,
+                pattern="dipole",
+                polarization="V",
+            ),
+            "ntn": self._make_planar_array(
+                num_rows=ntn_rows,
+                num_cols=ntn_cols,
+                pattern="vsat",
+                polarization="V",
+            ),
+        }
+
     def _add_bs_sector_receivers(self, name_prefix="bs-rx"):
         if self.tx_pos is None or self.tx_pos.shape[0] == 0:
             raise ValueError("tx_pos is empty; run compute_positions first.")
         if self.nsect is None:
-            raise ValueError("nsect is not set; run compute_paths first.")
+            raise ValueError("nsect is not set; configure sector metadata first.")
 
         if self.tx_orientation_rad is None:
-            sector_yaw = np.mod(
-                float(self.tx_sector_yaw_offset_rad) + 2.0 * np.pi * np.arange(self.nsect) / self.nsect,
-                2.0 * np.pi,
-            )
-            tx_orientation = []
-            for _ in range(self.nbs):
-                for s in range(self.nsect):
-                    tx_orientation.append(
-                        [
-                            float(sector_yaw[s]),
-                            float(self.tx_sector_pitch_rad),
-                            float(self.tx_sector_roll_rad),
-                        ]
-                    )
-            orientations = np.asarray(tx_orientation, dtype=float)
+            self._prepare_bs_sector_state()
+            orientations = np.asarray(self.tx_orientation_rad, dtype=float)
         else:
             orientations = np.asarray(self.tx_orientation_rad, dtype=float)
 
@@ -382,6 +458,30 @@ class SceneConfigSionna:
                 rx_name_list.append(rx.name)
                 flat_idx += 1
         return rx_name_list
+
+    def _add_bs_sector_transmitters(self, *, power_dbm, name_prefix="tx"):
+        if self.tx_pos is None or self.tx_pos.shape[0] == 0:
+            raise ValueError("tx_pos is empty; run compute_positions first.")
+        if self.nsect is None:
+            raise ValueError("nsect is not set; configure sector metadata first.")
+
+        if self.tx_orientation_rad is None:
+            self._prepare_bs_sector_state()
+
+        tx_name_list = []
+        flat_idx = 0
+        for bs_idx in range(self.tx_pos.shape[0]):
+            for sec_idx in range(self.nsect):
+                tx = Transmitter(
+                    name=f"{name_prefix}-{bs_idx}-{sec_idx}",
+                    position=self.tx_pos[bs_idx],
+                    power_dbm=float(power_dbm),
+                    orientation=np.asarray(self.tx_orientation_rad[flat_idx], dtype=float).tolist(),
+                )
+                self.scene.add(tx)
+                tx_name_list.append(tx.name)
+                flat_idx += 1
+        return tx_name_list
 
     def _add_tn_transmitters(self, *, power_dbm, name_prefix="tn-tx", indices=None):
         if self.tn_pos is None:
@@ -462,6 +562,11 @@ class SceneConfigSionna:
         else:
             indices = np.asarray(indices, dtype=int)
 
+        look_target = (
+            np.asarray(self.ntn_look_pos, dtype=float).tolist()
+            if self.ntn_look_pos is not None
+            else [0.0, 0.0, 20000.0]
+        )
         tx_name_list = []
         for i in indices:
             pos = self.rx_ntn_pos[int(i)]
@@ -473,7 +578,7 @@ class SceneConfigSionna:
             self.scene.add(tx)
             if hasattr(tx, "look_at"):
                 try:
-                    tx.look_at([0.0, 0.0, 20000.0])
+                    tx.look_at(look_target)
                 except Exception:
                     pass
             tx_name_list.append(tx.name)
@@ -510,6 +615,164 @@ class SceneConfigSionna:
             self.cm.zmin_grid[indices[:, 0], indices[:, 1]] + height_ground
         )
         return np.column_stack((x, y, z))
+
+    def compute_cir(
+        self,
+        *,
+        tx_array,
+        rx_array,
+        add_tx_fn,
+        add_rx_fn,
+        max_depth=3,
+        bandwidth=None,
+        tx_indices=None,
+        tx_batch_size=None,
+        add_tx_batch_fn=None,
+    ):
+        """Generic CIR computation for a configured TX/RX array pair."""
+        if bandwidth is not None:
+            self.scene.bandwidth = bandwidth
+        self.scene.synthetic_array = True
+        self._clear_radio_nodes()
+        self.scene.tx_array = tx_array
+        self.scene.rx_array = rx_array
+
+        p_solver = PathSolver()
+        if tx_batch_size is not None:
+            try:
+                if tx_indices is None or add_tx_batch_fn is None:
+                    raise ValueError("Batched CIR computation requires tx_indices and add_tx_batch_fn.")
+                return self._solve_cir_for_tx_batches(
+                    p_solver=p_solver,
+                    max_depth=max_depth,
+                    tx_indices=tx_indices,
+                    tx_batch_size=tx_batch_size,
+                    add_tx_batch_fn=add_tx_batch_fn,
+                    add_rx_fn=add_rx_fn,
+                )
+            finally:
+                self._clear_radio_nodes()
+                self._best_effort_rt_memory_cleanup()
+
+        add_tx_fn()
+        add_rx_fn()
+        try:
+            return self._solve_cir_numpy(p_solver, max_depth=max_depth)
+        finally:
+            self._clear_radio_nodes()
+            self._best_effort_rt_memory_cleanup()
+
+    def compute_two_mode_cirs(
+        self,
+        *,
+        nsect=3,
+        fc=None,
+        tx_rows=8,
+        tx_cols=8,
+        tn_rx_rows=1,
+        tn_rx_cols=1,
+        max_depth=3,
+        bandwidth=100e6,
+        tx_power_dbm=30,
+        tn_tx_power_dbm=None,
+        ntn_tx_power_dbm=None,
+        ntn_tx_batch_size=32,
+        sector_yaw_offset_rad=None,
+        sector_pitch_rad=None,
+        sector_roll_rad=None,
+    ):
+        """Compute the four CIR tensors used by the two-mode SINR workflow."""
+        bs_tx_power_dbm = float(tx_power_dbm)
+        if tn_tx_power_dbm is None:
+            tn_tx_power_dbm = bs_tx_power_dbm
+        if ntn_tx_power_dbm is None:
+            ntn_tx_power_dbm = bs_tx_power_dbm
+
+        self.configure_cir_scene(
+            nsect=nsect,
+            fc=fc,
+            bandwidth=bandwidth,
+            sector_yaw_offset_rad=sector_yaw_offset_rad,
+            sector_pitch_rad=sector_pitch_rad,
+            sector_roll_rad=sector_roll_rad,
+        )
+        arrays = self.build_standard_arrays(
+            tx_rows=tx_rows,
+            tx_cols=tx_cols,
+            tn_rx_rows=tn_rx_rows,
+            tn_rx_cols=tn_rx_cols,
+        )
+
+        a_bs_to_tn, tau_bs_to_tn = self.compute_cir(
+            tx_array=arrays["bs"],
+            rx_array=arrays["tn"],
+            add_tx_fn=lambda: self._add_bs_sector_transmitters(
+                power_dbm=bs_tx_power_dbm,
+                name_prefix="tx",
+            ),
+            add_rx_fn=lambda: self._add_tn_receivers(name_prefix="tn"),
+            max_depth=max_depth,
+            bandwidth=bandwidth,
+        )
+
+        a_tn_to_bs, tau_tn_to_bs = self.compute_cir(
+            tx_array=arrays["tn"],
+            rx_array=arrays["bs"],
+            add_tx_fn=lambda: self._add_tn_transmitters(power_dbm=tn_tx_power_dbm),
+            add_rx_fn=lambda: self._add_bs_sector_receivers(name_prefix="bs-rx-ul"),
+            max_depth=max_depth,
+            bandwidth=bandwidth,
+        )
+
+        if self.ntn_rx is None or int(self.ntn_rx) <= 0 or self.rx_ntn_pos is None:
+            a_ntn_to_bs = None
+            tau_ntn_to_bs = None
+            a_ntn_to_tn = None
+            tau_ntn_to_tn = None
+        else:
+            tx_indices = np.arange(self.rx_ntn_pos.shape[0], dtype=int)
+            a_ntn_to_bs, tau_ntn_to_bs = self.compute_cir(
+                tx_array=arrays["ntn"],
+                rx_array=arrays["bs"],
+                add_tx_fn=lambda: None,
+                add_rx_fn=lambda: self._add_bs_sector_receivers(name_prefix="bs-rx-int"),
+                max_depth=max_depth,
+                bandwidth=bandwidth,
+                tx_indices=tx_indices,
+                tx_batch_size=ntn_tx_batch_size,
+                add_tx_batch_fn=lambda batch: self._add_ntn_transmitters(
+                    power_dbm=ntn_tx_power_dbm,
+                    indices=batch,
+                ),
+            )
+            a_ntn_to_tn, tau_ntn_to_tn = self.compute_cir(
+                tx_array=arrays["ntn"],
+                rx_array=arrays["tn"],
+                add_tx_fn=lambda: None,
+                add_rx_fn=lambda: self._add_tn_receivers(name_prefix="tn-rx-int"),
+                max_depth=max_depth,
+                bandwidth=bandwidth,
+                tx_indices=tx_indices,
+                tx_batch_size=ntn_tx_batch_size,
+                add_tx_batch_fn=lambda batch: self._add_ntn_transmitters(
+                    power_dbm=ntn_tx_power_dbm,
+                    indices=batch,
+                ),
+            )
+
+        cir_out = {
+            "a_bs_to_tn": a_bs_to_tn,
+            "tau_bs_to_tn": tau_bs_to_tn,
+            "a_tn_to_bs": a_tn_to_bs,
+            "tau_tn_to_bs": tau_tn_to_bs,
+            "a_ntn_to_bs": a_ntn_to_bs,
+            "tau_ntn_to_bs": tau_ntn_to_bs,
+            "a_ntn_to_tn": a_ntn_to_tn,
+            "tau_ntn_to_tn": tau_ntn_to_tn,
+        }
+        for key, value in cir_out.items():
+            setattr(self, key, value)
+        return cir_out
 
     def compute_positions(self,
                         ntn_rx,
@@ -773,297 +1036,3 @@ class SceneConfigSionna:
         
         
         
-
-    def compute_paths(self, nsect, fc, tx_rows = 8, tx_cols = 8, tn_rx_rows = 1, tn_rx_cols = 1, max_depth=3,
-                      bandwidth=100e6, tx_power_dbm=30, compute_ntn_paths=True,
-                      sector_yaw_offset_rad=None,
-                      sector_pitch_rad=None,
-                      sector_roll_rad=None):
-        """
-        1) Configure scene frequency and remove old TX/RX
-        2) Add TX, add TN array and receivers => compute TN CIR
-        3) Remove TN, switch RX array to single-element custom => compute NTN CIR
-        sector_*_rad:
-            If None, use current object defaults:
-            self.tx_sector_yaw_offset_rad / self.tx_sector_pitch_rad / self.tx_sector_roll_rad.
-        """
-        if sector_yaw_offset_rad is None:
-            sector_yaw_offset_rad = self.tx_sector_yaw_offset_rad
-        if sector_pitch_rad is None:
-            sector_pitch_rad = self.tx_sector_pitch_rad
-        if sector_roll_rad is None:
-            sector_roll_rad = self.tx_sector_roll_rad
-
-        sector_yaw_offset_rad = float(sector_yaw_offset_rad)
-        sector_pitch_rad = float(sector_pitch_rad)
-        sector_roll_rad = float(sector_roll_rad)
-
-        # Keep the latest values for future calls
-        self.tx_sector_yaw_offset_rad = sector_yaw_offset_rad
-        self.tx_sector_pitch_rad = sector_pitch_rad
-        self.tx_sector_roll_rad = sector_roll_rad
-
-        self.fc = fc
-        self.nsect = nsect
-        self.scene.frequency = self.fc
-        self.scene.bandwidth = bandwidth
-        self.scene.synthetic_array = True
-
-        # Remove existing TX and RX
-        for rx_name in list(self.scene.receivers):
-            self.scene.remove(rx_name)
-        for tx_name in list(self.scene.transmitters):
-            self.scene.remove(tx_name)
-
-        # A. Set up the TX array
-        self.scene.tx_array = PlanarArray(
-            num_rows = tx_rows,
-            num_cols = tx_cols,
-            vertical_spacing=0.5,
-            horizontal_spacing=0.5,
-            polarization="V",
-            pattern="tr38901"
-        )
-
-        # B. Set up the multi-element array for the TN side
-        self.scene.rx_array = PlanarArray(
-            num_rows = tn_rx_rows,
-            num_cols = tn_rx_cols,
-            vertical_spacing=0.5,
-            horizontal_spacing=0.5,
-            polarization="V",
-            # pattern="tr38901"
-            pattern="dipole"
-        )
-
-        # (1) Add Transmitters
-        #    Use multiple sector approach for the single base station
-        sector_yaw = np.mod(
-            float(sector_yaw_offset_rad) + 2.0 * np.pi * np.arange(self.nsect) / self.nsect,
-            2.0 * np.pi,
-        )
-        tx_name_list = []
-        tx_bs_index = []
-        tx_sector_index = []
-        tx_orientation = []
-        for i in range(self.nbs):
-            for s in range(self.nsect):
-                yaw = float(sector_yaw[s])
-                name = f"tx-{i}-{s}"
-                tx = sionna.rt.Transmitter(
-                    name=name,
-                    position=self.tx_pos[i],
-                    power_dbm=tx_power_dbm,
-                    orientation=[yaw, float(sector_pitch_rad), float(sector_roll_rad)]
-                )
-                self.scene.add(tx)
-                tx_name_list.append(name)
-                tx_bs_index.append(int(i))
-                tx_sector_index.append(int(s))
-                tx_orientation.append([yaw, float(sector_pitch_rad), float(sector_roll_rad)])
-        self.tx_name_list = tx_name_list
-        self.tx_bs_index = np.asarray(tx_bs_index, dtype=int)
-        self.tx_sector_index = np.asarray(tx_sector_index, dtype=int)
-        self.tx_orientation_rad = np.asarray(tx_orientation, dtype=float)
-
-        # (2) Add TN Receivers
-        # Pair each TN with nearest BS and store index + sector index
-        if self.tx_pos is None or self.tx_pos.shape[0] == 0:
-            raise ValueError("tx_pos is empty; run compute_positions before compute_paths.")
-        diffs = self.tn_pos[:, None, :2] - self.tx_pos[None, :, :2]
-        d2 = np.sum(diffs**2, axis=2)
-        self.tn_bs_index = np.argmin(d2, axis=1)
-        # sector index based on angle from BS to TN
-        bs_xy = self.tx_pos[:, :2]
-        tn_xy = self.tn_pos[:, :2]
-        rel = tn_xy - bs_xy[self.tn_bs_index]
-        ang = np.mod(np.arctan2(rel[:, 1], rel[:, 0]), 2*np.pi)
-        sector_yaw = np.mod(
-            float(sector_yaw_offset_rad) + 2.0 * np.pi * np.arange(self.nsect) / self.nsect,
-            2.0 * np.pi,
-        )
-        # nearest sector center (circular distance)
-        dtheta = np.abs(ang[:, None] - sector_yaw[None, :])
-        dtheta = np.minimum(dtheta, 2*np.pi - dtheta)
-        self.tn_sector_index = np.argmin(dtheta, axis=1)
-        for i in range(self.tn_pos.shape[0]):
-            rx = sionna.rt.Receiver(
-                name=f"tn-{i}",
-                color=[0.0, 1.0, 0.0],
-                position=self.tn_pos[i]
-            )
-            self.scene.add(rx)
-            # Optional: look at nearest BS position (not strictly required)
-            rx.look_at(self.tx_pos[self.tn_bs_index[i]])
-            
-        # Compute paths for TN
-        p_solver  = PathSolver()
-        self.paths_tn = p_solver(scene=self.scene,
-                                max_depth=max_depth,
-                                los=True,
-                                specular_reflection=True,
-                                diffuse_reflection=False,
-                                refraction=True,
-                                synthetic_array=True)
-                                # seed=41)
-        
-        # Compute paths for TN
-        # [num_rx, num_rx_ant, num_tx, num_tx_ant, num_paths, num_time_steps]
-        self.a_tn, self.tau_tn = self.paths_tn.cir(normalize_delays=False, out_type="numpy")
-
-        if self.ntn_rx > 0 and bool(compute_ntn_paths):
-            for rx_name in list(self.scene.receivers):
-                self.scene.remove(rx_name)
-
-            self.scene.rx_array = PlanarArray(
-                num_rows=1,
-                num_cols=1,
-                vertical_spacing=0.5,
-                horizontal_spacing=0.5,
-                pattern="vsat",
-                polarization="V"
-            )
-
-            for i in range(self.rx_ntn_pos.shape[0]):
-                rx = sionna.rt.Receiver(
-                    name=f"ntn-{i}",
-                    color=[1.0, 0.0, 0.0],
-                    position=self.rx_ntn_pos[i]
-                )
-                self.scene.add(rx)
-                rx.look_at([0,0,20000])
-                # rx.look_at(self.ntn_look_pos+self.rx_ntn_pos[i])
-
-            
-            self.paths_ntn = p_solver(scene=self.scene,
-                                    max_depth=max_depth,
-                                    los=True,
-                                    specular_reflection=True,
-                                    diffuse_reflection=False,
-                                    refraction=True,
-                                    synthetic_array=True)
-                                    # seed=41)
-            
-            # Compute paths for TN
-
-            self.a_ntn, self.tau_ntn = self.paths_ntn.cir(normalize_delays=False, out_type="numpy")
-        else:
-            self.paths_ntn = None
-            self.a_ntn = None
-            self.tau_ntn = None
-
-    def compute_sinr_channels(
-        self,
-        tx_rows=8,
-        tx_cols=8,
-        tn_rows=1,
-        tn_cols=1,
-        max_depth=3,
-        bandwidth=100e6,
-        tn_tx_power_dbm=30,
-        ntn_tx_power_dbm=30,
-        ntn_tx_batch_size=32,
-    ):
-        """
-        Compute the extra channels required by the two-mode SINR experiment.
-
-        The current BS/TN/NTN positions and BS sector orientations are reused.
-        This method adds three additional link tensors:
-            1) TN  -> BS sectors
-            2) NTN -> BS sectors
-            3) NTN -> TN users
-        """
-        if self.tx_pos is None or self.tx_pos.shape[0] == 0:
-            raise ValueError("tx_pos is empty; run compute_positions first.")
-        if self.tn_pos is None:
-            raise ValueError("tn_pos is empty; run compute_positions first.")
-        if self.nsect is None:
-            raise ValueError("nsect is not set; run compute_paths first.")
-
-        self.scene.frequency = self.fc
-        self.scene.bandwidth = bandwidth
-        self.scene.synthetic_array = True
-
-        p_solver = PathSolver()
-
-        # TN -> BS sectors (uplink desired link for Mode 2)
-        self._clear_radio_nodes()
-        self.scene.tx_array = self._make_planar_array(
-            num_rows=tn_rows,
-            num_cols=tn_cols,
-            pattern="dipole",
-        )
-        self.scene.rx_array = self._make_planar_array(
-            num_rows=tx_rows,
-            num_cols=tx_cols,
-            pattern="tr38901",
-        )
-        self._add_tn_transmitters(power_dbm=tn_tx_power_dbm)
-        self._add_bs_sector_receivers(name_prefix="bs-rx-ul")
-        self.a_tn_to_bs, self.tau_tn_to_bs = self._solve_cir_numpy(
-            p_solver,
-            max_depth=max_depth,
-        )
-        self.paths_tn_to_bs = None
-        self._clear_radio_nodes()
-        self._best_effort_rt_memory_cleanup()
-
-        if self.ntn_rx is None or int(self.ntn_rx) <= 0 or self.rx_ntn_pos is None:
-            self.paths_ntn_to_bs = None
-            self.paths_ntn_to_tn = None
-            self.a_ntn_to_bs = None
-            self.tau_ntn_to_bs = None
-            self.a_ntn_to_tn = None
-            self.tau_ntn_to_tn = None
-            return
-
-        # NTN -> BS sectors (uplink interference for Mode 2)
-        self._clear_radio_nodes()
-        self.scene.tx_array = self._make_planar_array(
-            num_rows=1,
-            num_cols=1,
-            pattern="vsat",
-        )
-        self.scene.rx_array = self._make_planar_array(
-            num_rows=tx_rows,
-            num_cols=tx_cols,
-            pattern="tr38901",
-        )
-        self.a_ntn_to_bs, self.tau_ntn_to_bs = self._solve_cir_for_tx_batches(
-            p_solver=p_solver,
-            max_depth=max_depth,
-            tx_indices=np.arange(self.rx_ntn_pos.shape[0], dtype=int),
-            tx_batch_size=ntn_tx_batch_size,
-            add_tx_batch_fn=lambda batch: self._add_ntn_transmitters(
-                power_dbm=ntn_tx_power_dbm,
-                indices=batch,
-            ),
-            add_rx_fn=lambda: self._add_bs_sector_receivers(name_prefix="bs-rx-int"),
-        )
-        self.paths_ntn_to_bs = None
-
-        # NTN -> TN users (uplink interference for Mode 1)
-        self.scene.tx_array = self._make_planar_array(
-            num_rows=1,
-            num_cols=1,
-            pattern="vsat",
-        )
-        self.scene.rx_array = self._make_planar_array(
-            num_rows=tn_rows,
-            num_cols=tn_cols,
-            pattern="dipole",
-        )
-        self.a_ntn_to_tn, self.tau_ntn_to_tn = self._solve_cir_for_tx_batches(
-            p_solver=p_solver,
-            max_depth=max_depth,
-            tx_indices=np.arange(self.rx_ntn_pos.shape[0], dtype=int),
-            tx_batch_size=ntn_tx_batch_size,
-            add_tx_batch_fn=lambda batch: self._add_ntn_transmitters(
-                power_dbm=ntn_tx_power_dbm,
-                indices=batch,
-            ),
-            add_rx_fn=lambda: self._add_tn_receivers(name_prefix="tn-rx-int"),
-        )
-        self.paths_ntn_to_tn = None
-        self._clear_radio_nodes()
-        self._best_effort_rt_memory_cleanup()

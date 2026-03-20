@@ -62,8 +62,9 @@ Important assumptions in the current two-mode pipeline:
 For the current two-mode SINR workflow, the main Python APIs are:
 
 - `SceneConfigSionna.compute_positions(...)`
-- `SceneConfigSionna.compute_paths(...)`
-- `SceneConfigSionna.compute_sinr_channels(...)`
+- `SceneConfigSionna.build_standard_arrays(...)`
+- `SceneConfigSionna.compute_cir(...)`
+- `SceneConfigSionna.compute_two_mode_cirs(...)`
 - `sinr_cdf_utils.run_two_mode_sinr_cdf_experiment(...)`
 - `sinr_cdf_utils.save_two_mode_sinr_metrics(...)`
 
@@ -87,7 +88,7 @@ results = ncu.run_two_mode_sinr_cdf_experiment(
     num_macro_sims=N,
     ntn_drop_counts=[100, 200, 300],
     compute_positions_kwargs=compute_positions_kwargs,
-    compute_paths_kwargs=compute_paths_kwargs,
+    compute_cir_kwargs=compute_cir_kwargs,
     h_tn_th=h_tn_th,
     bs_tx_power=bs_tx_power,
     tn_tx_power=tn_tx_power,

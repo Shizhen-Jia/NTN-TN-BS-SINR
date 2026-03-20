@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import inspect
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
 
@@ -296,36 +295,6 @@ def compute_two_mode_sinr_samples(
     }
 
 
-def _build_sinr_channel_kwargs(compute_paths_kwargs: Dict[str, Any]) -> Dict[str, Any]:
-    tx_power_dbm_default = float(compute_paths_kwargs.get("tx_power_dbm", 30.0))
-    return {
-        "tx_rows": int(compute_paths_kwargs.get("tx_rows", 8)),
-        "tx_cols": int(compute_paths_kwargs.get("tx_cols", 8)),
-        "tn_rows": int(compute_paths_kwargs.get("tn_rx_rows", 1)),
-        "tn_cols": int(compute_paths_kwargs.get("tn_rx_cols", 1)),
-        "max_depth": int(compute_paths_kwargs.get("max_depth", 3)),
-        "bandwidth": float(compute_paths_kwargs.get("bandwidth", 100e6)),
-        "tn_tx_power_dbm": float(compute_paths_kwargs.get("tn_tx_power_dbm", tx_power_dbm_default)),
-        "ntn_tx_power_dbm": float(compute_paths_kwargs.get("ntn_tx_power_dbm", tx_power_dbm_default)),
-        "ntn_tx_batch_size": int(compute_paths_kwargs.get("ntn_tx_batch_size", 32)),
-    }
-
-
-def _filter_callable_kwargs(func: Any, kwargs: Dict[str, Any]) -> Dict[str, Any]:
-    """Keep only keyword arguments accepted by ``func``.
-
-    This lets the notebook use one high-level configuration dict while the
-    runner safely forwards only the parameters each scene method supports.
-    """
-    signature = inspect.signature(func)
-    accepted = {
-        name
-        for name, param in signature.parameters.items()
-        if param.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
-    }
-    return {key: value for key, value in kwargs.items() if key in accepted}
-
-
 def _resolve_scalar_or_uniform_range(value: Any, *, name: str) -> float:
     """Return a scalar as-is, or sample uniformly from a 2-value range."""
     if np.isscalar(value):
@@ -350,7 +319,7 @@ def run_two_mode_sinr_cdf_experiment(
     num_macro_sims: int,
     ntn_drop_counts: Iterable[int],
     compute_positions_kwargs: Dict[str, Any],
-    compute_paths_kwargs: Dict[str, Any],
+    compute_cir_kwargs: Dict[str, Any],
     h_tn_th: float,
     bs_tx_power: float,
     tn_tx_power: float,
@@ -374,13 +343,6 @@ def run_two_mode_sinr_cdf_experiment(
     if not ntn_counts:
         raise ValueError("ntn_drop_counts must contain at least one NTN count.")
 
-    path_kwargs = _filter_callable_kwargs(scene_config.compute_paths, compute_paths_kwargs)
-    if "compute_ntn_paths" in inspect.signature(scene_config.compute_paths).parameters:
-        path_kwargs.setdefault("compute_ntn_paths", False)
-    sinr_channel_kwargs = _filter_callable_kwargs(
-        scene_config.compute_sinr_channels,
-        _build_sinr_channel_kwargs(compute_paths_kwargs),
-    )
     mode1_sinr_all: Dict[int, List[float]] = {count: [] for count in ntn_counts}
     mode2_sinr_all: Dict[int, List[float]] = {count: [] for count in ntn_counts}
     macro_stats: Dict[int, List[Dict[str, Any]]] = {count: [] for count in ntn_counts}
@@ -426,43 +388,21 @@ def run_two_mode_sinr_cdf_experiment(
                     "The requested experiment assumes fixed BS positions."
                 )
 
-            scene_config.compute_paths(**path_kwargs)
-            for attr in ("paths_tn", "paths_ntn"):
-                if hasattr(scene_config, attr):
-                    setattr(scene_config, attr, None)
-            if hasattr(scene_config, "_best_effort_rt_memory_cleanup"):
-                scene_config._best_effort_rt_memory_cleanup()
-            scene_config.compute_sinr_channels(**sinr_channel_kwargs)
+            cir_out = scene_config.compute_two_mode_cirs(**compute_cir_kwargs)
 
-            h_bs_to_tn = collapse_cir_to_narrowband(scene_config.a_tn)
-            h_tn_to_bs = collapse_cir_to_narrowband(scene_config.a_tn_to_bs)
+            h_bs_to_tn = collapse_cir_to_narrowband(cir_out["a_bs_to_tn"])
+            h_tn_to_bs = collapse_cir_to_narrowband(cir_out["a_tn_to_bs"])
             h_ntn_to_tn = (
                 None
-                if scene_config.a_ntn_to_tn is None
-                else collapse_cir_to_narrowband(scene_config.a_ntn_to_tn)
+                if cir_out["a_ntn_to_tn"] is None
+                else collapse_cir_to_narrowband(cir_out["a_ntn_to_tn"])
             )
             h_ntn_to_bs = (
                 None
-                if scene_config.a_ntn_to_bs is None
-                else collapse_cir_to_narrowband(scene_config.a_ntn_to_bs)
+                if cir_out["a_ntn_to_bs"] is None
+                else collapse_cir_to_narrowband(cir_out["a_ntn_to_bs"])
             )
-            for attr in (
-                "a_tn",
-                "tau_tn",
-                "a_ntn",
-                "tau_ntn",
-                "a_tn_to_bs",
-                "tau_tn_to_bs",
-                "a_ntn_to_tn",
-                "tau_ntn_to_tn",
-                "a_ntn_to_bs",
-                "tau_ntn_to_bs",
-                "paths_tn_to_bs",
-                "paths_ntn_to_tn",
-                "paths_ntn_to_bs",
-            ):
-                if hasattr(scene_config, attr):
-                    setattr(scene_config, attr, None)
+            cir_out = None
             if hasattr(scene_config, "_best_effort_rt_memory_cleanup"):
                 scene_config._best_effort_rt_memory_cleanup()
 
