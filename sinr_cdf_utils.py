@@ -326,6 +326,24 @@ def _filter_callable_kwargs(func: Any, kwargs: Dict[str, Any]) -> Dict[str, Any]
     return {key: value for key, value in kwargs.items() if key in accepted}
 
 
+def _resolve_scalar_or_uniform_range(value: Any, *, name: str) -> float:
+    """Return a scalar as-is, or sample uniformly from a 2-value range."""
+    if np.isscalar(value):
+        return float(value)
+
+    arr = np.asarray(value, dtype=np.float64).reshape(-1)
+    if arr.size != 2:
+        raise ValueError(
+            f"{name} must be a scalar or a length-2 range, got shape {np.asarray(value).shape}."
+        )
+
+    low = float(arr[0])
+    high = float(arr[1])
+    if high < low:
+        raise ValueError(f"{name} range must satisfy low <= high, got ({low}, {high}).")
+    return float(np.random.uniform(low, high))
+
+
 def run_two_mode_sinr_cdf_experiment(
     scene_config: Any,
     *,
@@ -379,6 +397,16 @@ def run_two_mode_sinr_cdf_experiment(
         for sim_idx in iterator:
             pos_kwargs = dict(compute_positions_kwargs)
             pos_kwargs["ntn_rx"] = int(ntn_count)
+            if "azimuth" in pos_kwargs:
+                pos_kwargs["azimuth"] = _resolve_scalar_or_uniform_range(
+                    pos_kwargs["azimuth"],
+                    name="azimuth",
+                )
+            if "elevation" in pos_kwargs:
+                pos_kwargs["elevation"] = _resolve_scalar_or_uniform_range(
+                    pos_kwargs["elevation"],
+                    name="elevation",
+                )
             if plot_first_sim_only and did_plot_layout:
                 for key in ("plot_grid", "plot_bs", "plot_tn", "plot_ntn"):
                     if key in pos_kwargs:

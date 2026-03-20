@@ -1,5 +1,5 @@
 import os
-os.environ.pop("TF_USE_LEGACY_KERAS", None)   # 或 os.environ["TF_USE_LEGACY_KERAS"]="0"
+os.environ.pop("TF_USE_LEGACY_KERAS", None)   # Or set os.environ["TF_USE_LEGACY_KERAS"] = "0"
 import gc
 
 if os.getenv("CUDA_VISIBLE_DEVICES") is None:
@@ -517,8 +517,6 @@ class SceneConfigSionna:
                         azimuth,
                         elevation,
                         centerBS=True,
-                        bs_dist_min=35,
-                        bs_dist_max=1000,
                         bs_boundary=0.0,
                         bs_layout="random",
                         bs_grid=None,
@@ -604,22 +602,7 @@ class SceneConfigSionna:
             tx_y = np.zeros_like(tx_x)
             tx_x, tx_y, tx_z = self._snap_to_grid(tx_x, tx_y)
         else:
-            x_limit_min = x_min + bs_dist_max
-            x_limit_max = x_max - bs_dist_max
-            y_limit_min = y_min + bs_dist_max
-            y_limit_max = y_max - bs_dist_max
-            x_coords = self.cm.x[locations_outdoor[:, 1]]
-            y_coords = self.cm.y[locations_outdoor[:, 0]]
-            mask = (
-                (x_coords >= x_limit_min) & (x_coords <= x_limit_max) &
-                (y_coords >= y_limit_min) & (y_coords <= y_limit_max)
-            )
-            locations_outdoor_limited = locations_outdoor[mask]
-
-            # Prefer interior outdoor points; if too few, gracefully fall back.
-            if locations_outdoor_limited.shape[0] >= self.nbs:
-                tx_candidates = locations_outdoor_limited
-            elif locations_outdoor.shape[0] > 0:
+            if locations_outdoor.shape[0] > 0:
                 tx_candidates = locations_outdoor
             elif locations_building.shape[0] > 0:
                 tx_candidates = locations_building
@@ -678,22 +661,21 @@ class SceneConfigSionna:
             candidate_indices = np.vstack((rx_ntn_building_ind, rx_ntn_outdoor_ind))
 
         def filter_indices(indices):
-            # 根据 cm 坐标映射获得 x, y
+            # Map coverage-map indices to x/y coordinates
             rx_ntn_x = self.cm.x[indices[:, 1]]
             rx_ntn_y = self.cm.y[indices[:, 0]]
-            # 过滤条件：要求不在中心区域内
-            # 比如，中心 500x500 米区域：x 和 y 同时满足 |x|<250 且 |y|<250
+            # Filter condition: exclude points in the central region
+            # Example: exclude points with |x| < 250 and |y| < 800
             mask = ~((np.abs(rx_ntn_x) < 250) & (np.abs(rx_ntn_y) < 800))
             return indices[mask]
 
-        # 初步过滤
+        # Initial filtering
         filtered_indices = filter_indices(candidate_indices)
 
-        # 如果数量不足 ntn_rx，则不断补充
+        # Keep sampling until we have enough NTN receivers
         while filtered_indices.shape[0] < ntn_rx:
-            # 为补充，按照比例重新采样一些候选点
-            # 注意：为了防止 replace=False 时候候选点不足，可以设置 replace=True，
-            # 但这可能会有重复，最后再使用 np.unique 去重
+            # Re-sample extra candidate points using the desired ratio
+            # Use replace=True to avoid running out of candidates, then de-duplicate later
             extra_building = locations_building[
                 np.random.choice(locations_building.shape[0], max(1, int(0.8 * (ntn_rx - filtered_indices.shape[0])),), replace=True)
             ]
@@ -702,16 +684,16 @@ class SceneConfigSionna:
             ]
             extra_candidates = np.vstack((extra_building, extra_outdoor))
             extra_filtered = filter_indices(extra_candidates)
-            # 合并，去重
+            # Merge and de-duplicate
             filtered_indices = np.vstack((filtered_indices, extra_filtered))
-            # 去重（因为索引是整数数组，这里可以使用 np.unique ）
+            # Indices are integer arrays, so np.unique works well here
             filtered_indices = np.unique(filtered_indices, axis=0)
 
-        # 最终只保留前 ntn_rx 个（如果多于 ntn_rx 个）
+        # Keep only the first ntn_rx indices if we have extras
         if filtered_indices.shape[0] > ntn_rx:
             filtered_indices = filtered_indices[:ntn_rx]
 
-        # 更新映射后的 x, y 坐标
+        # Convert the final indices back to x/y coordinates
         rx_ntn_x = self.cm.x[filtered_indices[:, 1]]
         rx_ntn_y = self.cm.y[filtered_indices[:, 0]]
         rx_ntn_z = np.where(
