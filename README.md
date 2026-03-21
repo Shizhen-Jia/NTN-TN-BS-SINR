@@ -16,7 +16,9 @@ This repository currently contains two kinds of workflows:
   - `TN -> BS sectors`
   - `NTN -> BS sectors`
   - `NTN -> TN`
-- Added a two-mode SINR experiment flow with pair-wise traversal instead of the older `min_count` synchronized sector loop.
+- Added configurable BS beamforming modes for the two-mode SINR flow:
+  - legacy `pairwise_svd`
+  - grouped `covariance_sum` with random sector-wise grouping and `max_target`
 
 ## Two-Mode SINR Definition
 
@@ -38,7 +40,36 @@ Important assumptions in the current two-mode pipeline:
 - NTN users are treated only as interferers in the two-mode SINR flow.
 - No MUSIC detection is used for NTN interferers in the two-mode SINR calculation.
 - A SINR sample is recorded only when the corresponding direct-signal channel norm is above the configured threshold.
-- TN users are first paired to the strongest valid BS sector, then SINR is evaluated pair by pair.
+- TN users are first paired to the strongest valid BS sector, then processed either pair-by-pair or by random per-sector groups, depending on `bs_beamforming_mode`.
+
+## BS Beamforming Modes
+
+Two BS-side beamforming modes are now available in `sinr_cdf_utils.compute_two_mode_sinr_samples(...)`
+and `sinr_cdf_utils.run_two_mode_sinr_cdf_experiment(...)`:
+
+1. `pairwise_svd`
+   Legacy behavior.
+   Each paired `TN <-> BS sector` link uses its own single-user SVD beam.
+
+2. `covariance_sum`
+   New grouped behavior.
+   After TN/BS pairing, each BS sector randomly partitions its paired TNs into groups with
+   size drawn from `1..max_target` until all paired TNs in that sector are covered.
+
+For `covariance_sum`, the same random grouping is reused by both experiment modes:
+
+- `Mode 1 (BS -> TN)`
+  A shared BS transmit beam is built from the summed TX-side covariance of all TNs in the group.
+  Each TN in the group still produces its own downlink SINR sample.
+
+- `Mode 2 (TN -> BS)`
+  A shared BS receive beam is built from the summed RX-side covariance of all TNs in the group.
+  One uplink SINR sample is produced per group by summing the desired received powers of the TNs in that group.
+
+Recommended grouped setting:
+
+- `bs_beamforming_mode="covariance_sum"`
+- `max_target=4`
 
 ## Main Files
 
@@ -52,7 +83,7 @@ Important assumptions in the current two-mode pipeline:
   Notebook for experiment setup and plotting.
 
 - [BeamformingCalc.py](./BeamformingCalc.py)
-  SVD beamforming and MUSIC-guided nulling helpers.
+  SVD beamforming, covariance-sum beamforming, and MUSIC-guided nulling helpers.
 
 - [ntn_music_detection.py](./ntn_music_detection.py)
   MUSIC detection and angle-estimation helpers used by the older nulling-oriented flow.
@@ -95,6 +126,9 @@ results = ncu.run_two_mode_sinr_cdf_experiment(
     ntn_tx_power=ntn_tx_power,
     tn_noise_power=tn_noise_power,
     bs_noise_power=bs_noise_power,
+    bs_beamforming_mode="covariance_sum",
+    max_target=4,
+    beamforming_random_seed=0,
 )
 
 metrics_path = ncu.save_two_mode_sinr_metrics(
@@ -110,6 +144,7 @@ This produces:
 
 - three SINR curves in each figure for `NTN = 100, 200, 300`
 - saved metrics in `result/`
+- grouped-beamforming metadata such as `bs_beamforming_mode`, `max_target`, and per-sector group counts
 
 ## Outputs
 

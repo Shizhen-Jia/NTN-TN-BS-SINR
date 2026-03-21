@@ -5,7 +5,21 @@ from typing import Any, Dict, Iterable, List
 
 import numpy as np
 
-from BeamformingCalc import svd_bf
+from BeamformingCalc import covariance_sum_bf, matched_filter_rx, matched_filter_tx, svd_bf
+
+
+PAIRWISE_SVD_MODE = "pairwise_svd"
+COVARIANCE_SUM_MODE = "covariance_sum"
+_BS_BEAMFORMING_MODE_ALIASES = {
+    PAIRWISE_SVD_MODE: PAIRWISE_SVD_MODE,
+    "pairwise": PAIRWISE_SVD_MODE,
+    "svd": PAIRWISE_SVD_MODE,
+    "single_user_svd": PAIRWISE_SVD_MODE,
+    COVARIANCE_SUM_MODE: COVARIANCE_SUM_MODE,
+    "group_covariance_sum": COVARIANCE_SUM_MODE,
+    "covariance_sum_group": COVARIANCE_SUM_MODE,
+    "cov_sum": COVARIANCE_SUM_MODE,
+}
 
 
 
@@ -35,6 +49,100 @@ def _safe_db(power_linear: np.ndarray | float, eps: float = 1e-12) -> np.ndarray
     if np.isscalar(power_linear):
         return float(out)
     return out
+
+
+def _normalize_bs_beamforming_mode(mode: str) -> str:
+    key = str(mode).strip().lower()
+    try:
+        return _BS_BEAMFORMING_MODE_ALIASES[key]
+    except KeyError as exc:
+        valid = ", ".join(sorted(set(_BS_BEAMFORMING_MODE_ALIASES.values())))
+        raise ValueError(
+            f"Unsupported bs_beamforming_mode {mode!r}. Supported canonical modes: {valid}."
+        ) from exc
+
+
+def _matched_or_svd_rx(
+    h: np.ndarray,
+    w_tx: np.ndarray,
+    *,
+    eps: float = 1e-12,
+) -> np.ndarray:
+    try:
+        return matched_filter_rx(h, w_tx, eps=eps)
+    except ValueError:
+        _w_t, w_r = svd_bf(h, h.shape[0], eps=eps)
+        return np.asarray(w_r, dtype=np.complex128)
+
+
+def _matched_or_svd_tx(
+    h: np.ndarray,
+    w_rx: np.ndarray,
+    *,
+    eps: float = 1e-12,
+) -> np.ndarray:
+    try:
+        return matched_filter_tx(h, w_rx, eps=eps)
+    except ValueError:
+        w_t, _w_r = svd_bf(h, h.shape[0], eps=eps)
+        return np.asarray(w_t, dtype=np.complex128)
+
+
+def _build_random_tx_groups(
+    pairs_by_tx: Dict[int, List[Dict[str, Any]]],
+    *,
+    max_target: int,
+    rng: np.random.Generator,
+) -> Dict[str, Any]:
+    """Randomly partition each TX sector's paired TNs into groups of size 1..max_target."""
+    if int(max_target) <= 0:
+        raise ValueError("max_target must be positive.")
+
+    groups: List[Dict[str, Any]] = []
+    groups_by_tx: Dict[int, List[Dict[str, Any]]] = {}
+    tx_indices = sorted(int(tx_idx) for tx_idx in pairs_by_tx.keys())
+    group_count_by_tx = np.zeros((len(tx_indices),), dtype=int)
+    group_sizes: List[int] = []
+
+    for pos, tx_idx in enumerate(tx_indices):
+        tx_pairs = list(pairs_by_tx.get(int(tx_idx), []))
+        if not tx_pairs:
+            groups_by_tx[int(tx_idx)] = []
+            continue
+
+        order = rng.permutation(len(tx_pairs))
+        shuffled = [tx_pairs[int(i)] for i in order]
+
+        tx_groups: List[Dict[str, Any]] = []
+        cursor = 0
+        group_idx = 0
+        while cursor < len(shuffled):
+            draw = int(rng.integers(1, int(max_target) + 1))
+            group_pairs = shuffled[cursor : cursor + draw]
+            group_size = len(group_pairs)
+            record = {
+                "tx_idx": int(tx_idx),
+                "group_idx": int(group_idx),
+                "group_size": int(group_size),
+                "pairs": group_pairs,
+                "tn_indices": np.asarray([int(pair["tn_idx"]) for pair in group_pairs], dtype=int),
+            }
+            tx_groups.append(record)
+            groups.append(record)
+            group_sizes.append(int(group_size))
+            cursor += group_size
+            group_idx += 1
+
+        groups_by_tx[int(tx_idx)] = tx_groups
+        group_count_by_tx[pos] = len(tx_groups)
+
+    return {
+        "groups": groups,
+        "groups_by_tx": groups_by_tx,
+        "group_count_by_tx": group_count_by_tx,
+        "group_sizes": np.asarray(group_sizes, dtype=int),
+        "total_group_count": int(len(groups)),
+    }
 
 
 
@@ -204,11 +312,10 @@ def _aggregate_interference_power_linear(
     return float(max(power, 0.0))
 
 
-def compute_two_mode_sinr_samples(
-    h_bs_to_tn: np.ndarray,
-    h_tn_to_bs: np.ndarray,
-    h_ntn_to_tn: np.ndarray | None,
-    h_ntn_to_bs: np.ndarray | None,
+def _compute_pairwise_two_mode_sinr_samples(
+    h_ul_all: np.ndarray,
+    h_ntn_tn_all: np.ndarray | None,
+    h_ntn_bs_all: np.ndarray | None,
     *,
     pairs: List[Dict[str, Any]],
     bs_tx_power: float,
@@ -219,22 +326,7 @@ def compute_two_mode_sinr_samples(
     signal_threshold: float,
     eps: float = 1e-12,
 ) -> Dict[str, np.ndarray]:
-    """Compute pair-wise SINR samples for the two requested experiment modes.
-
-    NTN nodes are treated purely as interferers. No MUSIC detection is used.
-    A SINR sample is recorded for a mode only if that mode's direct-signal
-    channel norm exceeds `signal_threshold`.
-    """
-    h_dl_all = np.asarray(h_bs_to_tn, dtype=np.complex128)
-    h_ul_all = np.asarray(h_tn_to_bs, dtype=np.complex128)
-    if h_dl_all.ndim != 4:
-        raise ValueError("h_bs_to_tn must have shape (num_tn, num_tn_rx_ant, num_bs_sector, num_bs_tx_ant).")
-    if h_ul_all.ndim != 4:
-        raise ValueError("h_tn_to_bs must have shape (num_bs_sector, num_bs_rx_ant, num_tn, num_tn_tx_ant).")
-
-    h_ntn_tn_all = None if h_ntn_to_tn is None else np.asarray(h_ntn_to_tn, dtype=np.complex128)
-    h_ntn_bs_all = None if h_ntn_to_bs is None else np.asarray(h_ntn_to_bs, dtype=np.complex128)
-
+    """Original single-user SVD traversal."""
     mode1_sinr_db: List[float] = []
     mode2_sinr_db: List[float] = []
 
@@ -242,7 +334,6 @@ def compute_two_mode_sinr_samples(
         tn_idx = int(pair["tn_idx"])
         tx_idx = int(pair["tx_idx"])
 
-        # Mode 1: BS -> TN signal at TN, NTN -> TN interference.
         h_dl = np.asarray(pair["h_tn"], dtype=np.complex128)
         h_dl_norm = float(pair.get("h_norm", np.linalg.norm(h_dl)))
         if h_dl.ndim == 2 and h_dl_norm > max(float(signal_threshold), float(eps)):
@@ -266,11 +357,10 @@ def compute_two_mode_sinr_samples(
             sinr_mode1 = sig_mode1 / max(int_mode1 + float(tn_noise_power), float(eps))
             mode1_sinr_db.append(float(_safe_db(sinr_mode1, eps=eps)))
 
-        # Mode 2: TN -> BS signal at BS, NTN -> BS interference.
         h_ul = np.asarray(h_ul_all[tx_idx, :, tn_idx, :], dtype=np.complex128).T
         h_ul_norm = float(np.linalg.norm(h_ul))
         if h_ul.ndim == 2 and h_ul_norm > max(float(signal_threshold), float(eps)):
-            w_tn_tx, w_bs_rx = svd_bf(h_ul, h_ul.shape[0])
+            w_tn_tx, w_bs_rx = svd_bf(h_ul, h_ul.shape[0], eps=eps)
             sig_mode2 = _beamformed_link_power_linear(h_ul, w_tn_tx, w_bs_rx) * float(tn_tx_power)
 
             if h_ntn_bs_all is None or h_ntn_bs_all.size == 0:
@@ -293,6 +383,202 @@ def compute_two_mode_sinr_samples(
         "mode1_sinr_db": np.asarray(mode1_sinr_db, dtype=np.float64),
         "mode2_sinr_db": np.asarray(mode2_sinr_db, dtype=np.float64),
     }
+
+
+def _compute_grouped_covariance_sum_two_mode_sinr_samples(
+    h_ul_all: np.ndarray,
+    h_ntn_tn_all: np.ndarray | None,
+    h_ntn_bs_all: np.ndarray | None,
+    *,
+    groups: List[Dict[str, Any]],
+    bs_tx_power: float,
+    tn_tx_power: float,
+    ntn_tx_power: float,
+    tn_noise_power: float,
+    bs_noise_power: float,
+    signal_threshold: float,
+    eps: float = 1e-12,
+) -> Dict[str, np.ndarray]:
+    """Grouped BS beamforming using covariance summation within each paired sector."""
+    mode1_sinr_db: List[float] = []
+    mode2_sinr_db: List[float] = []
+
+    for group in groups:
+        tx_idx = int(group["tx_idx"])
+        group_pairs = list(group["pairs"])
+        if not group_pairs:
+            continue
+
+        h_dl_stack = np.stack(
+            [np.asarray(pair["h_tn"], dtype=np.complex128) for pair in group_pairs],
+            axis=0,
+        )
+        w_bs_tx, _tx_cov, _tx_max_eig = covariance_sum_bf(h_dl_stack, side="tx", eps=eps)
+
+        h_ul_stack = np.stack(
+            [
+                np.asarray(h_ul_all[tx_idx, :, int(pair["tn_idx"]), :], dtype=np.complex128).T
+                for pair in group_pairs
+            ],
+            axis=0,
+        )
+        w_bs_rx, _rx_cov, _rx_max_eig = covariance_sum_bf(h_ul_stack, side="rx", eps=eps)
+
+        if h_ntn_bs_all is None or h_ntn_bs_all.size == 0:
+            int_mode2_common = 0.0
+        else:
+            h_ntn_to_this_bs = _rx_slice_to_link_stack(h_ntn_bs_all[tx_idx, :, :, :])
+            int_mode2_common = (
+                _aggregate_interference_power_linear(
+                    h_ntn_to_this_bs,
+                    w_rx=w_bs_rx,
+                    eps=eps,
+                )
+                * float(ntn_tx_power)
+            )
+
+        sig_mode2_group = 0.0
+        valid_mode2_count = 0
+
+        for pair in group_pairs:
+            tn_idx = int(pair["tn_idx"])
+            h_dl = np.asarray(pair["h_tn"], dtype=np.complex128)
+            h_dl_norm = float(pair.get("h_norm", np.linalg.norm(h_dl)))
+            if h_dl.ndim == 2 and h_dl_norm > max(float(signal_threshold), float(eps)):
+                w_tn_rx = _matched_or_svd_rx(h_dl, w_bs_tx, eps=eps)
+                sig_mode1 = _beamformed_link_power_linear(h_dl, w_bs_tx, w_tn_rx) * float(bs_tx_power)
+
+                if h_ntn_tn_all is None or h_ntn_tn_all.size == 0:
+                    int_mode1 = 0.0
+                else:
+                    h_ntn_to_this_tn = _rx_slice_to_link_stack(h_ntn_tn_all[tn_idx, :, :, :])
+                    int_mode1 = (
+                        _aggregate_interference_power_linear(
+                            h_ntn_to_this_tn,
+                            w_rx=w_tn_rx,
+                            eps=eps,
+                        )
+                        * float(ntn_tx_power)
+                    )
+
+                sinr_mode1 = sig_mode1 / max(int_mode1 + float(tn_noise_power), float(eps))
+                mode1_sinr_db.append(float(_safe_db(sinr_mode1, eps=eps)))
+
+            h_ul = np.asarray(h_ul_all[tx_idx, :, tn_idx, :], dtype=np.complex128).T
+            h_ul_norm = float(np.linalg.norm(h_ul))
+            if h_ul.ndim == 2 and h_ul_norm > max(float(signal_threshold), float(eps)):
+                w_tn_tx = _matched_or_svd_tx(h_ul, w_bs_rx, eps=eps)
+                sig_mode2_group += (
+                    _beamformed_link_power_linear(h_ul, w_tn_tx, w_bs_rx) * float(tn_tx_power)
+                )
+                valid_mode2_count += 1
+
+        if valid_mode2_count > 0:
+            sinr_mode2 = sig_mode2_group / max(int_mode2_common + float(bs_noise_power), float(eps))
+            mode2_sinr_db.append(float(_safe_db(sinr_mode2, eps=eps)))
+
+    return {
+        "mode1_sinr_db": np.asarray(mode1_sinr_db, dtype=np.float64),
+        "mode2_sinr_db": np.asarray(mode2_sinr_db, dtype=np.float64),
+    }
+
+
+def compute_two_mode_sinr_samples(
+    h_bs_to_tn: np.ndarray,
+    h_tn_to_bs: np.ndarray,
+    h_ntn_to_tn: np.ndarray | None,
+    h_ntn_to_bs: np.ndarray | None,
+    *,
+    pairs: List[Dict[str, Any]],
+    pairs_by_tx: Dict[int, List[Dict[str, Any]]] | None = None,
+    bs_beamforming_mode: str = PAIRWISE_SVD_MODE,
+    max_target: int = 1,
+    rng: np.random.Generator | None = None,
+    bs_tx_power: float,
+    tn_tx_power: float,
+    ntn_tx_power: float,
+    tn_noise_power: float,
+    bs_noise_power: float,
+    signal_threshold: float,
+    eps: float = 1e-12,
+) -> Dict[str, Any]:
+    """
+    Compute two-mode SINR samples with configurable BS beamforming.
+
+    Supported BS beamforming modes:
+    - `pairwise_svd`: legacy one-pair-at-a-time SVD.
+    - `covariance_sum`: after TN/BS pairing, randomly group each BS sector's TNs
+      with group size in `[1, max_target]`, then build a shared BS beam from the
+      summed covariance of that group.
+    """
+    h_dl_all = np.asarray(h_bs_to_tn, dtype=np.complex128)
+    h_ul_all = np.asarray(h_tn_to_bs, dtype=np.complex128)
+    if h_dl_all.ndim != 4:
+        raise ValueError("h_bs_to_tn must have shape (num_tn, num_tn_rx_ant, num_bs_sector, num_bs_tx_ant).")
+    if h_ul_all.ndim != 4:
+        raise ValueError("h_tn_to_bs must have shape (num_bs_sector, num_bs_rx_ant, num_tn, num_tn_tx_ant).")
+    if int(max_target) <= 0:
+        raise ValueError("max_target must be positive.")
+
+    mode = _normalize_bs_beamforming_mode(bs_beamforming_mode)
+    h_ntn_tn_all = None if h_ntn_to_tn is None else np.asarray(h_ntn_to_tn, dtype=np.complex128)
+    h_ntn_bs_all = None if h_ntn_to_bs is None else np.asarray(h_ntn_to_bs, dtype=np.complex128)
+
+    if pairs_by_tx is None:
+        num_tx_total = int(h_dl_all.shape[2])
+        pairs_by_tx = {int(tx_idx): [] for tx_idx in range(num_tx_total)}
+        for pair in pairs:
+            pairs_by_tx[int(pair["tx_idx"])].append(pair)
+
+    if mode == PAIRWISE_SVD_MODE:
+        out = _compute_pairwise_two_mode_sinr_samples(
+            h_ul_all,
+            h_ntn_tn_all,
+            h_ntn_bs_all,
+            pairs=pairs,
+            bs_tx_power=bs_tx_power,
+            tn_tx_power=tn_tx_power,
+            ntn_tx_power=ntn_tx_power,
+            tn_noise_power=tn_noise_power,
+            bs_noise_power=bs_noise_power,
+            signal_threshold=signal_threshold,
+            eps=eps,
+        )
+        group_count_by_tx = np.asarray(
+            [len(pairs_by_tx[int(tx_idx)]) for tx_idx in sorted(pairs_by_tx.keys())],
+            dtype=int,
+        )
+        group_sizes = np.ones((len(pairs),), dtype=int)
+    else:
+        local_rng = rng if rng is not None else np.random.default_rng()
+        group_plan = _build_random_tx_groups(
+            pairs_by_tx,
+            max_target=int(max_target),
+            rng=local_rng,
+        )
+        out = _compute_grouped_covariance_sum_two_mode_sinr_samples(
+            h_ul_all,
+            h_ntn_tn_all,
+            h_ntn_bs_all,
+            groups=group_plan["groups"],
+            bs_tx_power=bs_tx_power,
+            tn_tx_power=tn_tx_power,
+            ntn_tx_power=ntn_tx_power,
+            tn_noise_power=tn_noise_power,
+            bs_noise_power=bs_noise_power,
+            signal_threshold=signal_threshold,
+            eps=eps,
+        )
+        group_count_by_tx = np.asarray(group_plan["group_count_by_tx"], dtype=int)
+        group_sizes = np.asarray(group_plan["group_sizes"], dtype=int)
+
+    out["group_count_by_tx"] = group_count_by_tx
+    out["group_sizes"] = group_sizes
+    out["total_group_count"] = int(group_sizes.size)
+    out["avg_group_size"] = float(np.mean(group_sizes)) if group_sizes.size > 0 else 0.0
+    out["bs_beamforming_mode"] = mode
+    out["max_target"] = int(max_target)
+    return out
 
 
 def _resolve_scalar_or_uniform_range(value: Any, *, name: str) -> float:
@@ -326,6 +612,9 @@ def run_two_mode_sinr_cdf_experiment(
     ntn_tx_power: float,
     tn_noise_power: float,
     bs_noise_power: float,
+    bs_beamforming_mode: str = PAIRWISE_SVD_MODE,
+    max_target: int = 1,
+    beamforming_random_seed: int | None = None,
     eps: float = 1e-12,
     plot_first_sim_only: bool = True,
     show_progress: bool = True,
@@ -348,6 +637,8 @@ def run_two_mode_sinr_cdf_experiment(
     macro_stats: Dict[int, List[Dict[str, Any]]] = {count: [] for count in ntn_counts}
     bs_pos_ref: np.ndarray | None = None
     did_plot_layout = False
+    normalized_mode = _normalize_bs_beamforming_mode(bs_beamforming_mode)
+    beamforming_rng = np.random.default_rng(beamforming_random_seed)
 
     for ntn_count in ntn_counts:
         iterator = (
@@ -421,6 +712,10 @@ def run_two_mode_sinr_cdf_experiment(
                 h_ntn_to_tn,
                 h_ntn_to_bs,
                 pairs=pairing["pairs"],
+                pairs_by_tx=pairing["pairs_by_tx"],
+                bs_beamforming_mode=normalized_mode,
+                max_target=int(max_target),
+                rng=beamforming_rng,
                 bs_tx_power=float(bs_tx_power),
                 tn_tx_power=float(tn_tx_power),
                 ntn_tx_power=float(ntn_tx_power),
@@ -434,6 +729,10 @@ def run_two_mode_sinr_cdf_experiment(
             mode2_sinr_all[int(ntn_count)].extend(sinr_out["mode2_sinr_db"].tolist())
 
             pair_counts_by_tx = np.asarray(pairing["pair_counts_by_tx"], dtype=int)
+            group_count_by_tx = np.asarray(
+                sinr_out.get("group_count_by_tx", pair_counts_by_tx),
+                dtype=int,
+            )
             macro_stats[int(ntn_count)].append(
                 {
                     "sim_idx": int(sim_idx),
@@ -442,6 +741,9 @@ def run_two_mode_sinr_cdf_experiment(
                     "num_tx_with_pairs": int(np.count_nonzero(pair_counts_by_tx > 0)),
                     "empty_tx_count": int(np.count_nonzero(pair_counts_by_tx == 0)),
                     "pair_counts_by_tx": pair_counts_by_tx.copy(),
+                    "group_count_by_tx": group_count_by_tx.copy(),
+                    "total_group_count": int(sinr_out.get("total_group_count", len(pairing["pairs"]))),
+                    "avg_group_size": float(sinr_out.get("avg_group_size", 1.0)),
                     "mode1_samples": int(sinr_out["mode1_sinr_db"].size),
                     "mode2_samples": int(sinr_out["mode2_sinr_db"].size),
                 }
@@ -449,6 +751,11 @@ def run_two_mode_sinr_cdf_experiment(
 
     return {
         "ntn_drop_counts": np.asarray(ntn_counts, dtype=int),
+        "bs_beamforming_mode": normalized_mode,
+        "max_target": int(max_target),
+        "beamforming_random_seed": (
+            None if beamforming_random_seed is None else int(beamforming_random_seed)
+        ),
         "mode1_sinr_db": {
             int(count): np.asarray(vals, dtype=np.float64) for count, vals in mode1_sinr_all.items()
         },
@@ -473,7 +780,14 @@ def save_two_mode_sinr_metrics(
 
     save_dict: Dict[str, Any] = {
         "ntn_drop_counts": np.asarray(experiment_out["ntn_drop_counts"], dtype=int),
+        "bs_beamforming_mode": np.asarray(str(experiment_out.get("bs_beamforming_mode", PAIRWISE_SVD_MODE))),
+        "max_target": np.asarray(int(experiment_out.get("max_target", 1)), dtype=int),
     }
+    if experiment_out.get("beamforming_random_seed") is not None:
+        save_dict["beamforming_random_seed"] = np.asarray(
+            int(experiment_out["beamforming_random_seed"]),
+            dtype=int,
+        )
 
     for count, vals in experiment_out.get("mode1_sinr_db", {}).items():
         save_dict[f"mode1_sinr_db_ntn_{int(count)}"] = np.asarray(vals, dtype=np.float64)
@@ -487,11 +801,17 @@ def save_two_mode_sinr_metrics(
         save_dict[f"{prefix}_paired_tn_count"] = np.asarray([row["paired_tn_count"] for row in rows], dtype=int)
         save_dict[f"{prefix}_num_tx_with_pairs"] = np.asarray([row["num_tx_with_pairs"] for row in rows], dtype=int)
         save_dict[f"{prefix}_empty_tx_count"] = np.asarray([row["empty_tx_count"] for row in rows], dtype=int)
+        save_dict[f"{prefix}_total_group_count"] = np.asarray([row["total_group_count"] for row in rows], dtype=int)
+        save_dict[f"{prefix}_avg_group_size"] = np.asarray([row["avg_group_size"] for row in rows], dtype=np.float64)
         save_dict[f"{prefix}_mode1_samples"] = np.asarray([row["mode1_samples"] for row in rows], dtype=int)
         save_dict[f"{prefix}_mode2_samples"] = np.asarray([row["mode2_samples"] for row in rows], dtype=int)
         if rows:
             save_dict[f"{prefix}_pair_counts_by_tx"] = np.stack(
                 [np.asarray(row["pair_counts_by_tx"], dtype=int) for row in rows],
+                axis=0,
+            )
+            save_dict[f"{prefix}_group_count_by_tx"] = np.stack(
+                [np.asarray(row["group_count_by_tx"], dtype=int) for row in rows],
                 axis=0,
             )
 

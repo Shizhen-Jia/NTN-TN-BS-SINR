@@ -1,7 +1,17 @@
 # beamforming_utils.py
 import numpy as np
 
-def svd_bf(h: np.ndarray, tx_antennas):
+
+def _normalize_vector(vec: np.ndarray, *, eps: float = 1e-12) -> np.ndarray:
+    """Return a unit-norm column vector."""
+    arr = np.asarray(vec, dtype=np.complex128).reshape(-1, 1)
+    norm = float(np.linalg.norm(arr))
+    if not np.isfinite(norm) or norm <= float(eps):
+        raise ValueError("Beamformer vector has zero (or invalid) norm.")
+    return arr / norm
+
+
+def svd_bf(h: np.ndarray, tx_antennas, eps: float = 1e-12):
     """
     Performs SVD-based beamforming to extract w_t (transmit beam) and w_r (receive beam).
 
@@ -17,16 +27,119 @@ def svd_bf(h: np.ndarray, tx_antennas):
     w_r : np.ndarray
         The first column of the right singular vectors, of shape (num_rx_antennas, 1).
     """
-    
-    # h = ((h)*np.sqrt(tx_antennas)  /np.linalg.norm(h))
-    h = (h) /np.linalg.norm(h)
-    # h = U * diag(s) * Vh
-    U, s, Vh = np.linalg.svd(h)
-    # Extract the principal singular-vector components
+    _ = tx_antennas
+    h = np.asarray(h, dtype=np.complex128)
+    h_norm = float(np.linalg.norm(h))
+    if not np.isfinite(h_norm) or h_norm <= float(eps):
+        raise ValueError("Channel matrix has zero (or invalid) norm.")
+
+    h = h / h_norm
+    U, _s, Vh = np.linalg.svd(h)
     w_t = U[:, 0].reshape(-1, 1)
     V = Vh.conj().T
     w_r = V[:, 0].reshape(-1, 1)
     return w_t, w_r
+
+
+def covariance_sum_bf(
+    h_links: np.ndarray,
+    *,
+    side: str,
+    eps: float = 1e-12,
+):
+    """
+    Compute a common beamformer from summed user covariances.
+
+    Parameters
+    ----------
+    h_links : np.ndarray
+        Stack of link matrices with shape
+        `(num_links, num_tx_ant, num_rx_ant)` or a single link with shape
+        `(num_tx_ant, num_rx_ant)`.
+    side : str
+        `"tx"` to form `sum_k H_k H_k^H`, or `"rx"` to form `sum_k H_k^H H_k`.
+    eps : float
+        Small value used for numerical validation.
+
+    Returns
+    -------
+    w : np.ndarray
+        Principal eigenvector of the summed covariance, as a column vector.
+    covariance : np.ndarray
+        The Hermitian summed covariance matrix.
+    max_eigen_value : float
+        Largest real eigenvalue of `covariance`.
+    """
+    h = np.asarray(h_links, dtype=np.complex128)
+    if h.ndim == 2:
+        h = h[np.newaxis, ...]
+    if h.ndim != 3:
+        raise ValueError(
+            "h_links must have shape (num_links, num_tx_ant, num_rx_ant) "
+            "or (num_tx_ant, num_rx_ant)."
+        )
+    if h.shape[0] == 0:
+        raise ValueError("h_links must contain at least one link.")
+
+    if side == "tx":
+        cov = np.zeros((h.shape[1], h.shape[1]), dtype=np.complex128)
+        for link in h:
+            cov += link @ link.conj().T
+    elif side == "rx":
+        cov = np.zeros((h.shape[2], h.shape[2]), dtype=np.complex128)
+        for link in h:
+            cov += link.conj().T @ link
+    else:
+        raise ValueError(f"side must be 'tx' or 'rx', got {side!r}.")
+
+    cov = 0.5 * (cov + cov.conj().T)
+    eigen_values, eigen_vectors = np.linalg.eigh(cov)
+    idx = int(np.argmax(np.real(eigen_values)))
+    max_eigen_value = float(np.real(eigen_values[idx]))
+    w = _normalize_vector(eigen_vectors[:, idx], eps=eps)
+    return w, cov, max_eigen_value
+
+
+def matched_filter_rx(
+    h: np.ndarray,
+    w_tx: np.ndarray,
+    *,
+    eps: float = 1e-12,
+) -> np.ndarray:
+    """
+    Best unit-norm receive combiner for a fixed transmit beam.
+    """
+    h_arr = np.asarray(h, dtype=np.complex128)
+    wt = _normalize_vector(w_tx, eps=eps)
+    if h_arr.ndim != 2:
+        raise ValueError("h must be 2D with shape (num_tx_ant, num_rx_ant).")
+    if h_arr.shape[0] != wt.shape[0]:
+        raise ValueError(
+            f"Transmit-beam mismatch: h has {h_arr.shape[0]} TX antennas, "
+            f"w_tx has {wt.shape[0]} entries."
+        )
+    return _normalize_vector(h_arr.conj().T @ wt, eps=eps)
+
+
+def matched_filter_tx(
+    h: np.ndarray,
+    w_rx: np.ndarray,
+    *,
+    eps: float = 1e-12,
+) -> np.ndarray:
+    """
+    Best unit-norm transmit beam for a fixed receive combiner.
+    """
+    h_arr = np.asarray(h, dtype=np.complex128)
+    wr = _normalize_vector(w_rx, eps=eps)
+    if h_arr.ndim != 2:
+        raise ValueError("h must be 2D with shape (num_tx_ant, num_rx_ant).")
+    if h_arr.shape[1] != wr.shape[0]:
+        raise ValueError(
+            f"Receive-beam mismatch: h has {h_arr.shape[1]} RX antennas, "
+            f"w_rx has {wr.shape[0]} entries."
+        )
+    return _normalize_vector(h_arr @ wr, eps=eps)
 
 
 def nulling_bf(h: np.ndarray, 

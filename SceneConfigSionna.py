@@ -432,7 +432,15 @@ class SceneConfigSionna:
             ),
         }
 
-    def _add_bs_sector_receivers(self, name_prefix="bs-rx"):
+    def _add_bs_sector_nodes(
+        self,
+        *,
+        role,
+        name_prefix,
+        power_dbm=None,
+    ):
+        if role not in {"tx", "rx"}:
+            raise ValueError(f"role must be 'tx' or 'rx', got {role!r}.")
         if self.tx_pos is None or self.tx_pos.shape[0] == 0:
             raise ValueError("tx_pos is empty; run compute_positions first.")
         if self.nsect is None:
@@ -440,118 +448,91 @@ class SceneConfigSionna:
 
         if self.tx_orientation_rad is None:
             self._prepare_bs_sector_state()
-            orientations = np.asarray(self.tx_orientation_rad, dtype=float)
-        else:
-            orientations = np.asarray(self.tx_orientation_rad, dtype=float)
+        orientations = np.asarray(self.tx_orientation_rad, dtype=float)
 
-        rx_name_list = []
+        node_name_list = []
         flat_idx = 0
         for bs_idx in range(self.tx_pos.shape[0]):
             for sec_idx in range(self.nsect):
-                rx = self._make_receiver(
-                    name=f"{name_prefix}-{bs_idx}-{sec_idx}",
-                    position=self.tx_pos[bs_idx],
-                    color=[1.0, 0.0, 0.0],
-                    orientation=orientations[flat_idx].tolist(),
-                )
-                self.scene.add(rx)
-                rx_name_list.append(rx.name)
+                if role == "tx":
+                    if power_dbm is None:
+                        raise ValueError("power_dbm is required when adding BS sector transmitters.")
+                    node = Transmitter(
+                        name=f"{name_prefix}-{bs_idx}-{sec_idx}",
+                        position=self.tx_pos[bs_idx],
+                        power_dbm=float(power_dbm),
+                        orientation=orientations[flat_idx].tolist(),
+                    )
+                else:
+                    node = self._make_receiver(
+                        name=f"{name_prefix}-{bs_idx}-{sec_idx}",
+                        position=self.tx_pos[bs_idx],
+                        color=[1.0, 0.0, 0.0],
+                        orientation=orientations[flat_idx].tolist(),
+                    )
+                self.scene.add(node)
+                node_name_list.append(node.name)
                 flat_idx += 1
-        return rx_name_list
+        return node_name_list
 
-    def _add_bs_sector_transmitters(self, *, power_dbm, name_prefix="tx"):
+    def _get_tn_bs_index(self):
+        if self.tn_pos is None:
+            raise ValueError("tn_pos is empty; run compute_positions first.")
         if self.tx_pos is None or self.tx_pos.shape[0] == 0:
             raise ValueError("tx_pos is empty; run compute_positions first.")
-        if self.nsect is None:
-            raise ValueError("nsect is not set; configure sector metadata first.")
 
-        if self.tx_orientation_rad is None:
-            self._prepare_bs_sector_state()
+        if self.tn_bs_index is None:
+            diffs = self.tn_pos[:, None, :2] - self.tx_pos[None, :, :2]
+            d2 = np.sum(diffs**2, axis=2)
+            self.tn_bs_index = np.argmin(d2, axis=1)
+        return np.asarray(self.tn_bs_index, dtype=int)
 
-        tx_name_list = []
-        flat_idx = 0
-        for bs_idx in range(self.tx_pos.shape[0]):
-            for sec_idx in range(self.nsect):
-                tx = Transmitter(
-                    name=f"{name_prefix}-{bs_idx}-{sec_idx}",
-                    position=self.tx_pos[bs_idx],
+    def _add_tn_nodes(
+        self,
+        *,
+        role,
+        name_prefix,
+        indices=None,
+        power_dbm=None,
+    ):
+        if role not in {"tx", "rx"}:
+            raise ValueError(f"role must be 'tx' or 'rx', got {role!r}.")
+
+        if self.tn_pos is None:
+            raise ValueError("tn_pos is empty; run compute_positions first.")
+        tn_bs_index = self._get_tn_bs_index()
+
+        if indices is None:
+            indices = np.arange(self.tn_pos.shape[0], dtype=int)
+        else:
+            indices = np.asarray(indices, dtype=int)
+
+        node_name_list = []
+        for i in indices:
+            pos = self.tn_pos[int(i)]
+            if role == "tx":
+                if power_dbm is None:
+                    raise ValueError("power_dbm is required when adding TN transmitters.")
+                node = Transmitter(
+                    name=f"{name_prefix}-{i}",
+                    position=pos,
                     power_dbm=float(power_dbm),
-                    orientation=np.asarray(self.tx_orientation_rad[flat_idx], dtype=float).tolist(),
                 )
-                self.scene.add(tx)
-                tx_name_list.append(tx.name)
-                flat_idx += 1
-        return tx_name_list
+            else:
+                node = self._make_receiver(
+                    name=f"{name_prefix}-{i}",
+                    position=pos,
+                    color=[0.0, 1.0, 0.0],
+                )
 
-    def _add_tn_transmitters(self, *, power_dbm, name_prefix="tn-tx", indices=None):
-        if self.tn_pos is None:
-            raise ValueError("tn_pos is empty; run compute_positions first.")
-        if self.tx_pos is None or self.tx_pos.shape[0] == 0:
-            raise ValueError("tx_pos is empty; run compute_positions first.")
-
-        if self.tn_bs_index is None:
-            diffs = self.tn_pos[:, None, :2] - self.tx_pos[None, :, :2]
-            d2 = np.sum(diffs**2, axis=2)
-            tn_bs_index = np.argmin(d2, axis=1)
-        else:
-            tn_bs_index = np.asarray(self.tn_bs_index, dtype=int)
-
-        if indices is None:
-            indices = np.arange(self.tn_pos.shape[0], dtype=int)
-        else:
-            indices = np.asarray(indices, dtype=int)
-
-        tx_name_list = []
-        for i in indices:
-            pos = self.tn_pos[int(i)]
-            tx = Transmitter(
-                name=f"{name_prefix}-{i}",
-                position=pos,
-                power_dbm=float(power_dbm),
-            )
-            self.scene.add(tx)
-            if hasattr(tx, "look_at"):
+            self.scene.add(node)
+            if hasattr(node, "look_at"):
                 try:
-                    tx.look_at(self.tx_pos[int(tn_bs_index[i])])
+                    node.look_at(self.tx_pos[int(tn_bs_index[i])])
                 except Exception:
                     pass
-            tx_name_list.append(tx.name)
-        return tx_name_list
-
-    def _add_tn_receivers(self, name_prefix="tn-rx", indices=None):
-        if self.tn_pos is None:
-            raise ValueError("tn_pos is empty; run compute_positions first.")
-        if self.tx_pos is None or self.tx_pos.shape[0] == 0:
-            raise ValueError("tx_pos is empty; run compute_positions first.")
-
-        if self.tn_bs_index is None:
-            diffs = self.tn_pos[:, None, :2] - self.tx_pos[None, :, :2]
-            d2 = np.sum(diffs**2, axis=2)
-            tn_bs_index = np.argmin(d2, axis=1)
-        else:
-            tn_bs_index = np.asarray(self.tn_bs_index, dtype=int)
-
-        if indices is None:
-            indices = np.arange(self.tn_pos.shape[0], dtype=int)
-        else:
-            indices = np.asarray(indices, dtype=int)
-
-        rx_name_list = []
-        for i in indices:
-            pos = self.tn_pos[int(i)]
-            rx = self._make_receiver(
-                name=f"{name_prefix}-{i}",
-                position=pos,
-                color=[0.0, 1.0, 0.0],
-            )
-            self.scene.add(rx)
-            if hasattr(rx, "look_at"):
-                try:
-                    rx.look_at(self.tx_pos[int(tn_bs_index[i])])
-                except Exception:
-                    pass
-            rx_name_list.append(rx.name)
-        return rx_name_list
+            node_name_list.append(node.name)
+        return node_name_list
 
     def _add_ntn_transmitters(self, *, power_dbm, name_prefix="ntn-tx", indices=None):
         if self.rx_ntn_pos is None:
@@ -706,11 +687,15 @@ class SceneConfigSionna:
         a_bs_to_tn, tau_bs_to_tn = self.compute_cir(
             tx_array=arrays["bs"],
             rx_array=arrays["tn"],
-            add_tx_fn=lambda: self._add_bs_sector_transmitters(
+            add_tx_fn=lambda: self._add_bs_sector_nodes(
+                role="tx",
                 power_dbm=bs_tx_power_dbm,
                 name_prefix="tx",
             ),
-            add_rx_fn=lambda: self._add_tn_receivers(name_prefix="tn"),
+            add_rx_fn=lambda: self._add_tn_nodes(
+                role="rx",
+                name_prefix="tn",
+            ),
             max_depth=max_depth,
             bandwidth=bandwidth,
         )
@@ -718,8 +703,15 @@ class SceneConfigSionna:
         a_tn_to_bs, tau_tn_to_bs = self.compute_cir(
             tx_array=arrays["tn"],
             rx_array=arrays["bs"],
-            add_tx_fn=lambda: self._add_tn_transmitters(power_dbm=tn_tx_power_dbm),
-            add_rx_fn=lambda: self._add_bs_sector_receivers(name_prefix="bs-rx-ul"),
+            add_tx_fn=lambda: self._add_tn_nodes(
+                role="tx",
+                name_prefix="tn-tx",
+                power_dbm=tn_tx_power_dbm,
+            ),
+            add_rx_fn=lambda: self._add_bs_sector_nodes(
+                role="rx",
+                name_prefix="bs-rx-ul",
+            ),
             max_depth=max_depth,
             bandwidth=bandwidth,
         )
@@ -735,7 +727,10 @@ class SceneConfigSionna:
                 tx_array=arrays["ntn"],
                 rx_array=arrays["bs"],
                 add_tx_fn=lambda: None,
-                add_rx_fn=lambda: self._add_bs_sector_receivers(name_prefix="bs-rx-int"),
+                add_rx_fn=lambda: self._add_bs_sector_nodes(
+                    role="rx",
+                    name_prefix="bs-rx-int",
+                ),
                 max_depth=max_depth,
                 bandwidth=bandwidth,
                 tx_indices=tx_indices,
@@ -749,7 +744,10 @@ class SceneConfigSionna:
                 tx_array=arrays["ntn"],
                 rx_array=arrays["tn"],
                 add_tx_fn=lambda: None,
-                add_rx_fn=lambda: self._add_tn_receivers(name_prefix="tn-rx-int"),
+                add_rx_fn=lambda: self._add_tn_nodes(
+                    role="rx",
+                    name_prefix="tn-rx-int",
+                ),
                 max_depth=max_depth,
                 bandwidth=bandwidth,
                 tx_indices=tx_indices,
