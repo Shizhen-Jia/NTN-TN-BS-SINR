@@ -82,6 +82,11 @@ Recommended grouped setting:
 - [SINR_CDF.ipynb](./SINR_CDF.ipynb)
   Notebook for experiment setup and plotting.
 
+- [SINR_LAYOUT_SNAPSHOT.ipynb](./SINR_LAYOUT_SNAPSHOT.ipynb)
+  Single-drop layout notebook that draws:
+  - the initial `BS / TN / NTN` positions
+  - the final `used TN / used NTN` positions after strongest-sector pairing
+
 - [BeamformingCalc.py](./BeamformingCalc.py)
   SVD beamforming, covariance-sum beamforming, and MUSIC-guided nulling helpers.
 
@@ -102,9 +107,26 @@ For the current two-mode SINR workflow, the main Python APIs are:
 Key functions:
 
 - `pair_tn_to_strongest_tx`
+- `collect_two_mode_layout_plot_data`
 - `compute_two_mode_sinr_samples`
 - `run_two_mode_sinr_cdf_experiment`
 - `save_two_mode_sinr_metrics`
+
+## Layout Snapshot Notebook
+
+`SINR_LAYOUT_SNAPSHOT.ipynb` is intended for visual inspection of one generated drop.
+
+Its second figure uses the following filtering logic:
+
+- `used TN`
+  TN users that survive strongest-sector pairing and the direct-link threshold.
+
+- `used NTN`
+  NTN users that have a non-zero narrowband channel to at least one final `used TN`
+  or at least one paired BS sector used by those TNs.
+
+In that second figure, each `used TN` is drawn with an outer circle whose color matches
+the paired BS only; sector identity is not shown there.
 
 ## Recommended Usage
 

@@ -224,6 +224,110 @@ def pair_tn_to_strongest_tx(
     }
 
 
+def collect_two_mode_layout_plot_data(
+    scene_config: Any,
+    h_bs_to_tn: np.ndarray,
+    *,
+    h_ntn_to_tn: np.ndarray | None = None,
+    h_ntn_to_bs: np.ndarray | None = None,
+    h_tn_th: float,
+    bs_tx_power: float,
+    tn_noise_power: float,
+    eps: float = 1e-12,
+) -> Dict[str, Any]:
+    """
+    Collect initial and final layout data for two-mode SINR plotting.
+
+    The "final used TN" set is the subset that survives strongest-sector pairing
+    and the direct-link threshold.
+
+    The "final used NTN" set keeps only NTN nodes that have a non-zero narrowband
+    channel to at least one final used TN or at least one paired BS sector.
+    """
+    h_dl = collapse_cir_to_narrowband(h_bs_to_tn)
+    h_ntn_tn_all = None if h_ntn_to_tn is None else collapse_cir_to_narrowband(h_ntn_to_tn)
+    h_ntn_bs_all = None if h_ntn_to_bs is None else collapse_cir_to_narrowband(h_ntn_to_bs)
+    pairing = pair_tn_to_strongest_tx(
+        h_dl,
+        h_tn_th=float(h_tn_th),
+        tx_antennas=int(h_dl.shape[3]),
+        tx_power=float(bs_tx_power),
+        snr_noise_power=float(tn_noise_power),
+        eps=eps,
+    )
+
+    if scene_config.tx_pos is None or scene_config.tn_pos is None:
+        raise ValueError("scene_config must already contain tx_pos and tn_pos.")
+
+    tx_pos = np.asarray(scene_config.tx_pos, dtype=np.float64)
+    tn_pos = np.asarray(scene_config.tn_pos, dtype=np.float64)
+    ntn_pos = (
+        np.empty((0, 3), dtype=np.float64)
+        if getattr(scene_config, "rx_ntn_pos", None) is None
+        else np.asarray(scene_config.rx_ntn_pos, dtype=np.float64)
+    )
+
+    paired_tn_idx = np.asarray(pairing["paired_tn_idx"], dtype=int)
+    paired_tn_pos = tn_pos[paired_tn_idx] if paired_tn_idx.size > 0 else np.empty((0, 3), dtype=np.float64)
+    paired_tx_idx = np.asarray([int(pair["tx_idx"]) for pair in pairing["pairs"]], dtype=int)
+
+    tx_bs_index = getattr(scene_config, "tx_bs_index", None)
+    if tx_bs_index is None:
+        nsect = getattr(scene_config, "nsect", None)
+        if nsect is None:
+            tx_bs_index = np.arange(h_dl.shape[2], dtype=int)
+        else:
+            tx_bs_index = np.arange(h_dl.shape[2], dtype=int) // int(nsect)
+    tx_bs_index = np.asarray(tx_bs_index, dtype=int)
+
+    paired_bs_idx = np.asarray(
+        [tx_bs_index[int(tx_idx)] for tx_idx in paired_tx_idx],
+        dtype=int,
+    )
+
+    used_ntn_mask = np.zeros((ntn_pos.shape[0],), dtype=bool)
+    if ntn_pos.shape[0] > 0:
+        if h_ntn_tn_all is not None and paired_tn_idx.size > 0:
+            if h_ntn_tn_all.ndim != 4:
+                raise ValueError(
+                    "h_ntn_to_tn must have shape (num_tn, num_tn_rx_ant, num_ntn, num_ntn_tx_ant)."
+                )
+            for tn_idx in paired_tn_idx:
+                h_ntn_to_this_tn = _rx_slice_to_link_stack(h_ntn_tn_all[int(tn_idx), :, :, :])
+                used_ntn_mask |= np.linalg.norm(h_ntn_to_this_tn.reshape(h_ntn_to_this_tn.shape[0], -1), axis=1) > float(eps)
+
+        if h_ntn_bs_all is not None and paired_tx_idx.size > 0:
+            if h_ntn_bs_all.ndim != 4:
+                raise ValueError(
+                    "h_ntn_to_bs must have shape (num_bs_sector, num_bs_rx_ant, num_ntn, num_ntn_tx_ant)."
+                )
+            for tx_idx in np.unique(paired_tx_idx):
+                h_ntn_to_this_bs = _rx_slice_to_link_stack(h_ntn_bs_all[int(tx_idx), :, :, :])
+                used_ntn_mask |= np.linalg.norm(h_ntn_to_this_bs.reshape(h_ntn_to_this_bs.shape[0], -1), axis=1) > float(eps)
+
+        if h_ntn_tn_all is None and h_ntn_bs_all is None:
+            used_ntn_mask[:] = True
+
+    used_ntn_idx = np.flatnonzero(used_ntn_mask)
+    used_ntn_pos = ntn_pos[used_ntn_idx] if used_ntn_idx.size > 0 else np.empty((0, 3), dtype=np.float64)
+
+    return {
+        "pairing": pairing,
+        "initial_bs_pos": tx_pos,
+        "initial_tn_pos": tn_pos,
+        "initial_ntn_pos": ntn_pos,
+        "used_tn_idx": paired_tn_idx,
+        "used_tn_pos": paired_tn_pos,
+        "used_ntn_idx": used_ntn_idx,
+        "used_ntn_pos": used_ntn_pos,
+        "used_bs_idx": paired_bs_idx,
+        "used_tx_idx": paired_tx_idx,
+        "tx_bs_index": tx_bs_index,
+        "extent": None if getattr(scene_config, "extent", None) is None else np.asarray(scene_config.extent, dtype=np.float64),
+        "point_type": None if getattr(scene_config, "point_type", None) is None else np.asarray(scene_config.point_type),
+    }
+
+
 
 
 def _beamformed_link_power_linear(
