@@ -26,15 +26,16 @@ tf.keras.backend.clear_session()
 from scipy.special import jv
 import mitsuba as mi
 from sionna.rt.antenna_pattern import register_antenna_pattern
-
+import vsat_dish_3gpp
 
 
 
 # Define constants (adjust these as needed)
-dish_diameter = 0.30        # meters
+dish_diameter = 0.60        # meters
 tx_gain_dB = 38.1           # dBi
 c = 3e8                     # speed of light (m/s)
-tx_frequency_mid = np.mean([13.75, 14.5]) * 1e9  # mid frequency in Hz
+# tx_frequency_mid = np.mean([13.75, 14.5]) * 1e9  # mid frequency in Hz
+tx_frequency_mid = np.mean([9.99, 9.99]) * 1e9  # mid frequency in Hz
 def v_vsat_pattern(theta: mi.Float, phi: mi.Float) -> mi.Complex2f:
     """
     Custom vertically-polarized VSAT antenna pattern.
@@ -427,7 +428,8 @@ class SceneConfigSionna:
             "ntn": self._make_planar_array(
                 num_rows=ntn_rows,
                 num_cols=ntn_cols,
-                pattern="vsat",
+                # pattern="vsat", vsat
+                pattern="vsat_dish",
                 polarization="V",
             ),
         }
